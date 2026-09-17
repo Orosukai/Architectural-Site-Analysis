@@ -57,7 +57,7 @@ st.markdown("""
   --card:   #f8f9fa;
 }
 
-html, body, [class*="css"] {
+html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
   font-family: 'JetBrains Mono', monospace !important;
   background-color: var(--paper) !important;
   color: var(--ink) !important;
