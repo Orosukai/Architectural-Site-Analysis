@@ -45,16 +45,17 @@ st.set_page_config(
 )
 
 st.markdown("""
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@300;400&display=swap');
 
 :root {
-  --ink:    #0f0f0f;
-  --paper:  #ffffff;
-  --accent: #2b2b2b;
-  --muted:  #707070;
-  --line:   #d1d1d1;
-  --card:   #f8f9fa;
+  --ink:    #ffffff;    /* Light text for dark mode */
+  --paper:  #0e1117;    /* Dark background */
+  --accent: #e0e0e0;
+  --muted:  #888888;
+  --line:   #333333;
+  --card:   #1a1c24;    /* Slightly lighter dark for sidebar */
 }
 
 html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
@@ -120,6 +121,7 @@ section[data-testid="stSidebar"] .stMarkdown a {
 }
 section[data-testid="stSidebar"] .stMarkdown a:hover { color: var(--ink) !important; }
 
+/* Standard Buttons */
 .stButton > button, .stDownloadButton > button {
   border-radius: 0px !important;
   font-family: 'JetBrains Mono', monospace !important;
@@ -128,20 +130,28 @@ section[data-testid="stSidebar"] .stMarkdown a:hover { color: var(--ink) !import
   text-transform: uppercase;
   border: 1px solid var(--line) !important;
   background-color: var(--paper) !important;
-  color: var(--ink) !important;
   transition: all 0.2s ease;
   width: 100%;
+}
+.stButton > button *, .stDownloadButton > button * {
+  color: var(--ink) !important;
 }
 .stButton > button:hover, .stDownloadButton > button:hover {
   border-color: var(--ink) !important;
 }
+
+/* Primary Buttons (fixes the Load All issue) */
 .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
   background-color: var(--ink) !important;
-  color: var(--paper) !important;
   border: 1px solid var(--ink) !important;
+}
+.stButton > button[kind="primary"] *, .stDownloadButton > button[kind="primary"] * {
+  color: var(--paper) !important;
 }
 .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
   background-color: var(--paper) !important;
+}
+.stButton > button[kind="primary"]:hover *, .stDownloadButton > button[kind="primary"]:hover * {
   color: var(--ink) !important;
 }
 
@@ -169,6 +179,7 @@ input[type="text"], .stTextInput input {
   background-color: var(--paper) !important;
   border: 1px solid var(--line) !important;
   border-radius: 0 !important;
+  color: var(--ink) !important;
   font-family: 'JetBrains Mono', monospace !important;
 }
 [data-testid="stSlider"] > div > div > div { background-color: var(--ink) !important; }
@@ -191,7 +202,6 @@ iframe, [data-testid="stImage"] img, .stPyplot img {
 }
 </style>
 """, unsafe_allow_html=True)
-
 # ==============================================================================
 # CACHED DATA FETCHERS
 # ==============================================================================
