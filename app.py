@@ -45,7 +45,6 @@ st.set_page_config(
 )
 
 st.markdown("""
-st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@300;400&display=swap');
 
