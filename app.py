@@ -2,13 +2,21 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import osmnx as ox
+
+# Route OSMnx to a secondary Overpass server to avoid rate limits.
+# osmnx 2.x reads `overpass_url` (full interpreter URL); osmnx 1.x reads `overpass_endpoint`.
+ox.settings.overpass_url = "https://lz4.overpass-api.de/api/interpreter"
+ox.settings.overpass_endpoint = "https://lz4.overpass-api.de/api"
+
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.colors import LinearSegmentedColormap
 import io
 import math
+import time
 import warnings
 import requests
 import numpy as np
@@ -20,7 +28,9 @@ import pydeck as pdk
 import pandas as pd
 import json
 import geopandas as gpd
-from shapely.geometry import Point, LineString, box
+from shapely.geometry import Point, LineString, Polygon, box
+from shapely.affinity import translate
+from shapely.ops import unary_union
 from scipy.interpolate import griddata
 from scipy.spatial import cKDTree
 import pyproj
@@ -49,15 +59,15 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@300;400&display=swap');
 
 :root {
-  --ink:    #ffffff;    /* Light text for dark mode */
-  --paper:  #0e1117;    /* Dark background */
-  --accent: #e0e0e0;
-  --muted:  #888888;
-  --line:   #333333;
-  --card:   #1a1c24;    /* Slightly lighter dark for sidebar */
+  --ink:    #0f0f0f;
+  --paper:  #ffffff;
+  --accent: #2b2b2b;
+  --muted:  #707070;
+  --line:   #d1d1d1;
+  --card:   #f8f9fa;
 }
 
-html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+html, body, [class*="css"] {
   font-family: 'JetBrains Mono', monospace !important;
   background-color: var(--paper) !important;
   color: var(--ink) !important;
@@ -120,7 +130,6 @@ section[data-testid="stSidebar"] .stMarkdown a {
 }
 section[data-testid="stSidebar"] .stMarkdown a:hover { color: var(--ink) !important; }
 
-/* Standard Buttons */
 .stButton > button, .stDownloadButton > button {
   border-radius: 0px !important;
   font-family: 'JetBrains Mono', monospace !important;
@@ -129,28 +138,20 @@ section[data-testid="stSidebar"] .stMarkdown a:hover { color: var(--ink) !import
   text-transform: uppercase;
   border: 1px solid var(--line) !important;
   background-color: var(--paper) !important;
+  color: var(--ink) !important;
   transition: all 0.2s ease;
   width: 100%;
-}
-.stButton > button *, .stDownloadButton > button * {
-  color: var(--ink) !important;
 }
 .stButton > button:hover, .stDownloadButton > button:hover {
   border-color: var(--ink) !important;
 }
-
-/* Primary Buttons (fixes the Load All issue) */
 .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
   background-color: var(--ink) !important;
-  border: 1px solid var(--ink) !important;
-}
-.stButton > button[kind="primary"] *, .stDownloadButton > button[kind="primary"] * {
   color: var(--paper) !important;
+  border: 1px solid var(--ink) !important;
 }
 .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
   background-color: var(--paper) !important;
-}
-.stButton > button[kind="primary"]:hover *, .stDownloadButton > button[kind="primary"]:hover * {
   color: var(--ink) !important;
 }
 
@@ -178,7 +179,6 @@ input[type="text"], .stTextInput input {
   background-color: var(--paper) !important;
   border: 1px solid var(--line) !important;
   border-radius: 0 !important;
-  color: var(--ink) !important;
   font-family: 'JetBrains Mono', monospace !important;
 }
 [data-testid="stSlider"] > div > div > div { background-color: var(--ink) !important; }
@@ -201,20 +201,61 @@ iframe, [data-testid="stImage"] img, .stPyplot img {
 }
 </style>
 """, unsafe_allow_html=True)
+
 # ==============================================================================
 # CACHED DATA FETCHERS
 # ==============================================================================
 
+EMPTY_GDF_CRS = "EPSG:4326"
+
+
+def _empty_gdf():
+    return gpd.GeoDataFrame(geometry=[], crs=EMPTY_GDF_CRS)
+
+
+def _fetch_elevations(pts):
+    """Query OpenTopoData in batches of 100 (public API: max 1 request/second)."""
+    all_elevs = []
+    for start in range(0, len(pts), 100):
+        batch = pts[start:start + 100]
+        url = ("https://api.opentopodata.org/v1/srtm30m?locations="
+               + "|".join(f"{p[0]},{p[1]}" for p in batch))
+        elevs = [None] * len(batch)
+        for attempt in range(2):
+            try:
+                if start > 0 or attempt > 0:
+                    time.sleep(1.2)
+                res = requests.get(url, timeout=25).json()
+                if res.get("status") == "OK":
+                    elevs = [r["elevation"] for r in res["results"]]
+                    break
+            except Exception:
+                pass
+        all_elevs.extend(elevs)
+    return all_elevs
+
+
+def _elevation_points(lat, lon, radius, n):
+    dlat = radius / 111320
+    dlon = radius / (111320 * math.cos(math.radians(lat)))
+    return [
+        (lat - dlat + i * (2 * dlat / (n - 1)),
+         lon - dlon + j * (2 * dlon / (n - 1)))
+        for i in range(n) for j in range(n)
+    ]
+
+
 @st.cache_data(show_spinner=False)
 def fetch_buildings(lat, lon, radius):
-    tags = {"building": True}
-    gdf = ox.features_from_point((lat, lon), tags, dist=radius)
+    gdf = ox.features_from_point((lat, lon), {"building": True}, dist=radius)
     return gdf[gdf.geom_type.isin(["Polygon", "MultiPolygon"])]
+
 
 @st.cache_data(show_spinner=False)
 def fetch_graph(lat, lon, radius):
     G = ox.graph_from_point((lat, lon), dist=radius, network_type="all")
     return ox.graph_to_gdfs(G, nodes=False, edges=True)
+
 
 @st.cache_data(show_spinner=False)
 def fetch_wind_data(lat, lon):
@@ -227,23 +268,18 @@ def fetch_wind_data(lat, lon):
     res = requests.get(url, timeout=15).json()
     return res["daily"]["wind_direction_10m_dominant"], res["daily"]["wind_speed_10m_max"]
 
+
+
 @st.cache_data(show_spinner=False)
 def fetch_flood_layers(lat, lon, radius):
     waterway_tags = {"waterway": ["river", "stream", "canal", "drain",
                                   "ditch", "culvert", "pressurised"]}
     water_area_tags = {
-        "natural":     ["water", "wetland", "mud"],
-        "landuse":     ["reservoir", "basin", "floodplain"],
-        "water":       True,
-        "flood_prone": True,
+        "natural": ["water", "wetland", "mud"],
+        "landuse": ["reservoir", "basin", "floodplain"],
+        "water":   True,
     }
-    # OSM ways (a river, a long power line, etc.) are returned in FULL — osmnx does
-    # not truncate a way's geometry to the query box, only checks whether it
-    # intersects it. A river can run for kilometres past the site radius, which
-    # blows out the plot's autoscaled extent and makes everything else look
-    # offset/tiny. Clip every water geometry to a (slightly padded) box matching
-    # the query radius so nothing renders outside the area we actually asked for.
-    pad    = 1.05
+    pad = 1.05
     dlat_c = (radius * pad) / 111320
     dlon_c = (radius * pad) / (111320 * math.cos(math.radians(lat)))
     clip_box = box(lon - dlon_c, lat - dlat_c, lon + dlon_c, lat + dlat_c)
@@ -262,28 +298,8 @@ def fetch_flood_layers(lat, lon, radius):
     except Exception:
         water_bodies = None
 
-    # Use a denser 13×13 grid (169 pts — fits in one API call ≤100 max so batch)
-    n    = 13
-    dlat = radius / 111320
-    dlon = radius / (111320 * math.cos(math.radians(lat)))
-    pts  = [
-        (lat - dlat + i * (2 * dlat / (n - 1)),
-         lon - dlon + j * (2 * dlon / (n - 1)))
-        for i in range(n) for j in range(n)
-    ]
-    all_elevs = []
-    for start in range(0, len(pts), 100):
-        batch = pts[start:start + 100]
-        url   = ("https://api.opentopodata.org/v1/srtm30m?locations="
-                 + "|".join(f"{p[0]},{p[1]}" for p in batch))
-        try:
-            res = requests.get(url, timeout=25).json()
-            if res.get("status") == "OK":
-                all_elevs.extend([r["elevation"] for r in res["results"]])
-            else:
-                all_elevs.extend([None] * len(batch))
-        except Exception:
-            all_elevs.extend([None] * len(batch))
+    pts = _elevation_points(lat, lon, radius, 13)
+    all_elevs = _fetch_elevations(pts)
 
     elev_grid = None
     if any(e is not None for e in all_elevs):
@@ -293,6 +309,7 @@ def fetch_flood_layers(lat, lon, radius):
             "elevations": all_elevs,
         }
     return waterways, water_bodies, elev_grid
+
 
 @st.cache_data(show_spinner=False)
 def fetch_access_points(lat, lon, radius):
@@ -310,6 +327,7 @@ def fetch_access_points(lat, lon, radius):
         transit = None
     return edges, transit
 
+
 @st.cache_data(show_spinner=False)
 def fetch_landmarks(lat, lon, radius):
     tags = {
@@ -326,7 +344,11 @@ def fetch_landmarks(lat, lon, radius):
         "shop":    ["convenience", "supermarket", "general", "mall"],
         "leisure": ["park"],
     }
-    return ox.features_from_point((lat, lon), tags, dist=radius)
+    try:
+        return ox.features_from_point((lat, lon), tags, dist=radius)
+    except Exception:
+        return _empty_gdf()
+
 
 @st.cache_data(show_spinner=False)
 def fetch_land_use(lat, lon, radius):
@@ -353,38 +375,30 @@ def fetch_land_use(lat, lon, radius):
     except Exception:
         return None
 
+
 @st.cache_data(show_spinner=False)
 def fetch_utilities(lat, lon, radius):
-    # Electrical: poles, transmission lines, minor cables, transformers
     power_tags = {
         "power": ["pole", "line", "minor_line", "cable", "transformer",
                   "switch", "junction", "connection"],
     }
-    # Sewer / drainage: manholes, sewer lines, storm drains, culverts
     sewer_tags = {
-        "man_made":  ["manhole", "sewer", "wastewater_plant",
-                      "pumping_station", "storage_tank"],
-        "waterway":  ["drain", "ditch", "culvert", "pressurised"],
-        "pipeline":  ["sewer", "sewage", "drain", "stormwater"],
+        "man_made": ["manhole", "sewer", "wastewater_plant",
+                     "pumping_station", "storage_tank", "pipeline"],
+        "waterway": ["drain", "ditch", "culvert", "pressurised"],
     }
-    # Local water supply: fire hydrants, water valves, meters
     water_tags = {
         "emergency": ["fire_hydrant"],
         "man_made":  ["water_meter", "valve", "water_tap",
                       "water_tower", "water_works"],
         "waterway":  ["canal", "stream"],
     }
-    # Telecom: street-level conduits, cabinets, junction boxes
     telecom_tags = {
         "telecom":  ["distribution_point", "connection_point",
                      "street_cabinet", "exchange", "service_device"],
         "man_made": ["street_cabinet", "antenna"],
     }
-    # Same issue as waterways: a transmission line, canal, or sewer main can run
-    # for kilometres past the query radius since osmnx doesn't truncate a way's
-    # geometry, only checks whether it intersects the box. Clip everything back
-    # to the analysis radius so it can't drag the plot's extent along with it.
-    pad    = 1.05
+    pad = 1.05
     dlat_c = (radius * pad) / 111320
     dlon_c = (radius * pad) / (111320 * math.cos(math.radians(lat)))
     clip_box = box(lon - dlon_c, lat - dlat_c, lon + dlon_c, lat + dlat_c)
@@ -405,31 +419,11 @@ def fetch_utilities(lat, lon, radius):
             results[name] = None
     return results
 
+
 @st.cache_data(show_spinner=False)
 def fetch_topography_detailed(lat, lon, radius):
-    """Fetch a denser elevation grid (15×15) for topography mapping."""
-    dlat = radius / 111320
-    dlon = radius / (111320 * math.cos(math.radians(lat)))
-    n    = 15
-    pts  = [
-        (lat - dlat + i * (2 * dlat / (n - 1)),
-         lon - dlon + j * (2 * dlon / (n - 1)))
-        for i in range(n) for j in range(n)
-    ]
-    all_elevs = []
-    batch_size = 100
-    for start in range(0, len(pts), batch_size):
-        batch = pts[start:start + batch_size]
-        url   = ("https://api.opentopodata.org/v1/srtm30m?locations="
-                 + "|".join(f"{p[0]},{p[1]}" for p in batch))
-        try:
-            res = requests.get(url, timeout=25).json()
-            if res.get("status") == "OK":
-                all_elevs.extend([r["elevation"] for r in res["results"]])
-            else:
-                all_elevs.extend([None] * len(batch))
-        except Exception:
-            all_elevs.extend([None] * len(batch))
+    pts = _elevation_points(lat, lon, radius, 15)
+    all_elevs = _fetch_elevations(pts)
     return {"lats": [p[0] for p in pts],
             "lons": [p[1] for p in pts],
             "elevations": all_elevs}
@@ -446,23 +440,52 @@ def road_width(highway_val, scale=1.0):
     if "residential" in t or "unclassified" in t: return 1.5 * scale
     return 0.6 * scale
 
-@st.cache_resource(show_spinner=False)
-def get_utm_proj(lat, lon):
-    """Build (and cache) the UTM projection for this site's location."""
-    return pyproj.Proj(proj="utm", zone=int((lon + 180) / 6) + 1, ellps="WGS84")
 
-def project_center(lat, lon):
-    proj = get_utm_proj(lat, lon)
-    return proj(lon, lat)
+def edge_widths(edges, scale=1.0, default=1.0):
+    if "highway" in edges.columns:
+        return edges["highway"].apply(lambda x: road_width(x, scale))
+    return pd.Series(default * scale, index=edges.index)
 
-def sun_path_points(lat, lon, date, radius_m):
-    loc    = LocationInfo("Site", "Region", "UTC", lat, lon)
-    cx, cy = project_center(lat, lon)
-    max_r  = radius_m * 0.85
-    pts    = []
+
+def lonlat_to_xy(lons, lats, crs):
+    """Transform lon/lat arrays into the given projected CRS (always lon, lat order)."""
+    tr = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    xs, ys = tr.transform(np.asarray(lons, dtype=float), np.asarray(lats, dtype=float))
+    return np.asarray(xs), np.asarray(ys)
+
+
+def project_center(lat, lon, crs):
+    x, y = lonlat_to_xy([lon], [lat], crs)
+    return float(x[0]), float(y[0])
+
+
+def load_base(lat, lon, radius):
+    """Buildings + street edges in a common projected CRS, plus the site centre."""
+    buildings = fetch_buildings(lat, lon, radius)
+    buildings_p = ox.projection.project_gdf(buildings)
+    crs = buildings_p.crs
+    edges_p = fetch_graph(lat, lon, radius).to_crs(crs)
+    cx, cy = project_center(lat, lon, crs)
+    return buildings_p, edges_p, crs, cx, cy
+
+def get_carto_key():
+    """Returns the personal CARTO Basemaps API key."""
+    return "cb1_4dpu_1_858a2eddbeb8483dfe150952"
+
+
+def site_tz(lon):
+    """Approximate local time zone from longitude (Manila ≈ UTC+8)."""
+    return datetime.timezone(datetime.timedelta(hours=round(lon / 15)))
+
+
+def sun_path_points(lat, lon, date, radius_m, cx, cy):
+    loc   = LocationInfo("Site", "Region", "UTC", lat, lon)
+    tz    = site_tz(lon)
+    max_r = radius_m * 0.85
+    pts   = []
     for h in range(24):
         for m in [0, 10, 20, 30, 40, 50]:
-            t  = datetime.datetime.combine(date, datetime.time(h, m, tzinfo=datetime.timezone.utc))
+            t  = datetime.datetime.combine(date, datetime.time(h, m), tzinfo=tz)
             el = elevation(loc.observer, t)
             if el > 0:
                 az    = azimuth(loc.observer, t)
@@ -470,7 +493,43 @@ def sun_path_points(lat, lon, date, radius_m):
                 angle = math.radians(90.0 - az)
                 pts.append((t, cx + r * math.cos(angle), cy + r * math.sin(angle)))
     pts.sort(key=lambda x: x[0])
-    return pts, cx, cy
+    return pts
+
+
+def building_heights(df, default):
+    heights = []
+    for _, row in df.iterrows():
+        h = default
+        raw = row.get("height")
+        lev = row.get("building:levels")
+        if raw is not None and pd.notnull(raw):
+            try:
+                h = float(str(raw).lower().replace("m", "").replace(",", ".").strip())
+                heights.append(h); continue
+            except ValueError:
+                pass
+        if lev is not None and pd.notnull(lev):
+            try:
+                h = float(str(lev).strip()) * 3.0
+            except ValueError:
+                pass
+        heights.append(h)
+    return heights
+
+
+def shadow_polygon(geom, dx, dy):
+    """Swept shadow: footprint + translated footprint + quads along every wall."""
+    parts = [geom, translate(geom, xoff=dx, yoff=dy)]
+    polys = [geom] if geom.geom_type == "Polygon" else list(getattr(geom, "geoms", []))
+    for p in polys:
+        c = list(p.exterior.coords)
+        for a, b in zip(c[:-1], c[1:]):
+            q = Polygon([(a[0], a[1]), (b[0], b[1]),
+                         (b[0] + dx, b[1] + dy), (a[0] + dx, a[1] + dy)])
+            if q.is_valid and q.area > 0:
+                parts.append(q)
+    return unary_union(parts)
+
 
 def save_fig_to_svg(fig):
     buf = io.BytesIO()
@@ -478,101 +537,59 @@ def save_fig_to_svg(fig):
     buf.seek(0)
     return buf
 
+
 def save_fig_to_dxf(fig):
-    """Convert a matplotlib figure to a DXF R2010 file."""
+    """Export plotted geometry to DXF in data coordinates (projected metres)."""
     if not _HAS_EZDXF:
         return save_fig_to_svg(fig).getvalue(), "svg"
-        
     try:
         from matplotlib.collections import (
-            PathCollection, LineCollection, PolyCollection
+            PathCollection, LineCollection, PolyCollection, PatchCollection
         )
 
         doc = ezdxf.new("R2010")
-        doc.header["$INSUNITS"] = 6      # metres
+        doc.header["$INSUNITS"] = 6   # metres
         msp = doc.modelspace()
 
+        def _pts(arr):
+            return [(float(p[0]), float(p[1])) for p in arr
+                    if np.isfinite(p[0]) and np.isfinite(p[1])]
+
         for ax in fig.get_axes():
-            trans = ax.transData
-
-            # --- Line2D artists ---
-            for artist in ax.get_lines():
-                if not artist.get_visible():
+            for line in ax.get_lines():
+                if not line.get_visible():
                     continue
-                xd, yd = artist.get_xdata(), artist.get_ydata()
-                if len(xd) < 2:
-                    continue
-                pts = trans.transform(list(zip(xd, yd)))
-                msp.add_lwpolyline(
-                    [(p[0], p[1]) for p in pts],
-                    dxfattribs={"layer": "LINES"}
-                )
+                pts = _pts(zip(line.get_xdata(), line.get_ydata()))
+                if len(pts) >= 2:
+                    msp.add_lwpolyline(pts, dxfattribs={"layer": "LINES"})
 
-            # --- Collections (Lines, Points, Polygons) ---
             for artist in ax.collections:
                 if not artist.get_visible():
                     continue
-                    
                 if isinstance(artist, LineCollection):
-                    segs = artist.get_segments()
-                    for seg in segs:
-                        if len(seg) >= 2:
-                            pts = trans.transform(seg)
-                            msp.add_lwpolyline(
-                                [(p[0], p[1]) for p in pts],
-                                dxfattribs={"layer": "EDGES"}
-                            )
-                            
-                # ADDED: Handle Geopandas Polygons 
-                elif isinstance(artist, PolyCollection):
+                    for seg in artist.get_segments():
+                        pts = _pts(seg)
+                        if len(pts) >= 2:
+                            msp.add_lwpolyline(pts, dxfattribs={"layer": "EDGES"})
+                elif isinstance(artist, (PatchCollection, PolyCollection)):
                     for path in artist.get_paths():
-                        verts = trans.transform(path.vertices)
-                        if len(verts) >= 2:
-                            msp.add_lwpolyline(
-                                [(v[0], v[1]) for v in verts],
-                                close=True,
-                                dxfattribs={"layer": "BUILDINGS"}
-                            )
-                            
+                        for ring in path.to_polygons(closed_only=False):
+                            pts = _pts(ring)
+                            if len(pts) >= 3:
+                                msp.add_lwpolyline(pts, close=True,
+                                                   dxfattribs={"layer": "BUILDINGS"})
                 elif isinstance(artist, PathCollection):
-                    offsets = artist.get_offsets()
-                    if len(offsets):
-                        pts = trans.transform(offsets)
-                        for p in pts:
-                            msp.add_point(
-                                (p[0], p[1], 0),
-                                dxfattribs={"layer": "POINTS"}
-                            )
+                    for p in _pts(artist.get_offsets()):
+                        msp.add_point((p[0], p[1], 0), dxfattribs={"layer": "POINTS"})
 
-            # --- Patch artists ---
-            for patch in ax.patches:
-                if not patch.get_visible():
-                    continue
-                try:
-                    path = patch.get_path()
-                    verts = trans.transform(path.vertices)
-                    if len(verts) >= 2:
-                        msp.add_lwpolyline(
-                            [(v[0], v[1]) for v in verts],
-                            close=True,
-                            dxfattribs={"layer": "BUILDINGS"}
-                        )
-                except Exception:
-                    pass
+        buf = io.StringIO()
+        doc.write(buf)
+        return buf.getvalue().encode(doc.encoding or "cp1252", errors="replace"), "dxf"
 
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-            tmppath = tmp.name
-        doc.saveas(tmppath)
-        with open(tmppath, "rb") as f:
-            data = f.read()
-        os.unlink(tmppath)
-        return data, "dxf"
-        
     except Exception as e:
-        # Failsafe fallback — surface the real reason instead of failing silently
         st.session_state.setdefault("_dxf_errors", []).append(str(e))
         return save_fig_to_svg(fig).getvalue(), "svg"
+
 
 def classify_landmark(row):
     amenity = str(getattr(row, "amenity", "nan")).lower()
@@ -581,7 +598,7 @@ def classify_landmark(row):
     leisure = str(getattr(row, "leisure", "nan")).lower()
 
     if amenity in {"school", "university", "college"}:               return "Education",         "#3498DB", "^"
-    if amenity in {"hospital", "clinic", "doctors", "pharmacy"}:     return "Health",            "#E74C3C", "+"
+    if amenity in {"hospital", "clinic", "doctors", "pharmacy"}:     return "Health",            "#E74C3C", "P"
     if railway in {"station", "halt", "tram_stop", "subway_entrance"} \
        or amenity in {"bus_station", "ferry_terminal"}:              return "Transit Hub",       "#9B59B6", "D"
     if amenity in {"restaurant", "cafe", "fast_food", "food_court"}: return "Food & Dining",    "#E67E22", "o"
@@ -593,7 +610,7 @@ def classify_landmark(row):
     if leisure == "park":                                            return "Park / Green",      "#2ECC71", "*"
     return "Other", "#BDC3C7", "."
 
-# Land use colour palette
+
 LAND_USE_PALETTE = {
     "residential":       ("#FFEAA7", "Residential"),
     "commercial":        ("#FAB1A0", "Commercial"),
@@ -638,12 +655,14 @@ LAND_USE_PALETTE = {
 }
 
 UTILITY_STYLES = {
-    # key: (line_color, point_color, line_lw, line_style, point_marker, point_size, label)
     "power":   ("#F1C40F", "#FFD700", 1.4, "--",  "^", 60,  "Powerline / Electrical"),
     "sewer":   ("#8B4513", "#A0522D", 1.2, "-.",  "o", 50,  "Sewer / Drain"),
     "water":   ("#3498DB", "#5DADE2", 1.3, "-",   "s", 55,  "Water Supply / Hydrant"),
     "telecom": ("#9B59B6", "#AF7AC5", 1.0, ":",   "D", 45,  "Telecom / Cabinet"),
 }
+
+WATER_LABELS = {"Water", "Water Basin", "Reservoir", "Wetland", "Floodplain"}
+
 
 def classify_land_use(row):
     for field in ["landuse", "leisure", "amenity", "natural"]:
@@ -671,6 +690,55 @@ if "svg_exports" not in st.session_state:
 if "gallery_images" not in st.session_state:
     st.session_state.gallery_images = {}
 
+# Widget-backed keys are initialised here (not via value=/index=) so they can be
+# safely updated from callbacks.
+if "radius_val" not in st.session_state:
+    st.session_state.radius_val = 500
+if "_radius_slider" not in st.session_state:
+    st.session_state._radius_slider = st.session_state.radius_val
+if "_radius_text" not in st.session_state:
+    st.session_state._radius_text = str(st.session_state.radius_val)
+if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "Sections"
+
+# ==============================================================================
+# CALLBACKS
+# ==============================================================================
+
+def _sync_slider():
+    v = int(st.session_state._radius_slider)
+    st.session_state.radius_val = v
+    st.session_state._radius_text = str(v)
+
+
+def _sync_text():
+    try:
+        v = max(100, min(2000, int(st.session_state._radius_text)))
+    except ValueError:
+        v = st.session_state.radius_val
+    st.session_state.radius_val = v
+    st.session_state._radius_slider = v
+    st.session_state._radius_text = str(v)
+
+
+def _load_all():
+    for mod in MODULES:
+        st.session_state[mod] = True
+
+
+def _clear_all():
+    for mod in MODULES:
+        st.session_state[mod] = False
+    st.session_state.svg_exports = {}
+    st.session_state.gallery_images = {}
+
+
+def _generate_all_and_go_to_sections():
+    # Runs as a callback, i.e. before the `view_mode` radio is instantiated,
+    # which is the only time its session-state value may be changed.
+    _load_all()
+    st.session_state.view_mode = "Sections"
+
 # ==============================================================================
 # SIDEBAR
 # ==============================================================================
@@ -684,33 +752,19 @@ try:
     sep = "," if "," in coord_input else None
     lat_str, lon_str = coord_input.split(sep, 1)
     lat, lon = float(lat_str.strip()), float(lon_str.strip())
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("out of range")
 except Exception:
     st.sidebar.error("⚠️ Invalid format. Using default.")
     lat, lon = 14.0700, 121.3255
 
-# --- Synced radius: slider + text box ---
-if "radius_val" not in st.session_state:
-    st.session_state.radius_val = 500
-
-def _sync_slider():
-    st.session_state.radius_val = st.session_state._radius_slider
-
-def _sync_text():
-    try:
-        v = int(st.session_state._radius_text)
-        st.session_state.radius_val = max(100, min(2000, v))
-    except ValueError:
-        pass
-
 st.sidebar.slider(
     "Analysis Radius (m)", 100, 2000,
-    value=st.session_state.radius_val,
     key="_radius_slider",
     on_change=_sync_slider,
 )
 st.sidebar.text_input(
     "Radius (m) — type exact value",
-    value=str(st.session_state.radius_val),
     key="_radius_text",
     on_change=_sync_text,
     placeholder="100 – 2000",
@@ -718,23 +772,14 @@ st.sidebar.text_input(
 radius = st.session_state.radius_val
 
 col_a, col_b = st.sidebar.columns(2)
-if col_a.button("Load All", type="primary"):
-    for mod in MODULES:
-        st.session_state[mod] = True
-    st.rerun()
-if col_b.button("Clear All"):
-    for mod in MODULES:
-        st.session_state[mod] = False
-    st.session_state.svg_exports = {}
-    st.session_state.gallery_images = {}
-    st.rerun()
+col_a.button("Load All", type="primary", on_click=_load_all)
+col_b.button("Clear All", on_click=_clear_all)
 
 st.sidebar.markdown("---")
 
 view_mode = st.sidebar.radio(
     "View",
     ["Sections", "Gallery"],
-    index=0,
     key="view_mode",
     help="Sections — load and inspect maps one at a time.\n"
          "Gallery — see every map generated so far together, in a grid.",
@@ -813,26 +858,24 @@ def load_button(mod_key, label="Load Map"):
         return False
     return True
 
+
 def set_site_extent(ax, cx, cy, radius, pad=1.05):
-    """Force the visible plot area to the analysis radius, regardless of how far
-    any individual feature's geometry (e.g. a river) actually extends. Without
-    this, a single far-reaching geometry drags matplotlib's autoscale out with
-    it and everything else on the map ends up squeezed into a corner."""
     ax.set_xlim(cx - radius * pad, cx + radius * pad)
     ax.set_ylim(cy - radius * pad, cy + radius * pad)
     ax.set_aspect("equal")
 
-DISPLAY_WIDTH = 620  # px — keeps maps from stretching edge-to-edge on screen
+
+DISPLAY_WIDTH = 620
+
 
 def display_and_store(fig, base_name, display_width=DISPLAY_WIDTH):
-    """Render a figure at a fixed, moderate on-screen width (instead of
-    stretching to the full column width) and stash a PNG copy for the gallery."""
     png_buf = io.BytesIO()
     fig.savefig(png_buf, format="png", dpi=150, bbox_inches="tight",
                 pad_inches=0.05, facecolor=fig.get_facecolor())
     png_bytes = png_buf.getvalue()
     st.session_state.gallery_images[base_name] = png_bytes
     st.image(png_bytes, width=display_width)
+
 
 def download_button(filename, data, mime="image/svg+xml"):
     ext = filename.split(".")[-1].upper()
@@ -845,8 +888,8 @@ def download_button(filename, data, mime="image/svg+xml"):
         use_container_width=True,
     )
 
+
 def export_buttons(base_name, fig, svg_data):
-    """Show SVG download (always) and optional DXF download based on sidebar choice."""
     use_dxf = st.session_state.get("use_dxf", False)
     if use_dxf:
         col1, col2 = st.columns(2)
@@ -863,77 +906,84 @@ def export_buttons(base_name, fig, svg_data):
     else:
         download_button(base_name + ".svg", svg_data)
 
+
+def finish_figure(fig, key, base_name):
+    """Shared tail: SVG export, on-screen PNG, download buttons, close figure."""
+    svg_data = save_fig_to_svg(fig).getvalue()
+    st.session_state.svg_exports[f"{key}.svg"] = svg_data
+    display_and_store(fig, key)
+    export_buttons(key, fig, svg_data)
+    plt.close(fig)
+
+
 if view_mode == "Sections":
-    # ==============================================================================
+    # ==========================================================================
     # 1. BASE MAP
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Base Map", anchor="base-map")
 
     if load_button("base_map"):
         with st.spinner("Loading base map…"):
-            m = folium.Map(location=[lat, lon], zoom_start=15, tiles="CartoDB positron")
+            m = folium.Map(location=[lat, lon], zoom_start=15, tiles="OpenStreetMap")
             folium.Circle(radius=radius, location=[lat, lon], color="#2b2b2b",
                           fill=True, fill_opacity=0.07, weight=1.5).add_to(m)
             folium.Marker([lat, lon], tooltip="Site Centre").add_to(m)
-            st_folium(m, width=820, height=460)
+            # returned_objects=[] stops map pan/zoom from triggering full-app reruns
+            st_folium(m, width=820, height=460, returned_objects=[])
             html_data = m.get_root().render().encode("utf-8")
             st.session_state.svg_exports["01_base_map.html"] = html_data
             download_button("01_base_map.html", html_data, "text/html")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 2. FIGURE-GROUND
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Figure-Ground", anchor="figure-ground")
 
     if load_button("figure_ground"):
         with st.spinner("Rendering figure-ground diagram…"):
             try:
-                buildings      = fetch_buildings(lat, lon, radius)
-                edges          = fetch_graph(lat, lon, radius)
-                buildings_proj = ox.projection.project_gdf(buildings)
-                target_crs     = buildings_proj.crs
-                edges_proj     = ox.projection.project_gdf(edges).to_crs(target_crs)
-
-                cx, cy = project_center(lat, lon)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
 
                 fig, ax = plt.subplots(figsize=(10, 10), facecolor="white")
                 ax.set_facecolor("white")
-                edges_proj["w"] = edges_proj["highway"].apply(lambda x: road_width(x, scale=0.8)) if "highway" in edges_proj.columns else 1.0
-                edges_proj.plot(ax=ax, linewidth=edges_proj["w"], color="black", zorder=1)
-                buildings_proj.plot(ax=ax, facecolor="black", edgecolor="none", zorder=2)
+                edges_p["w"] = edge_widths(edges_p, 0.8)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="black", zorder=1)
+                buildings_p.plot(ax=ax, facecolor="black", edgecolor="none", zorder=2)
                 set_site_extent(ax, cx, cy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["02_figure_ground.svg"] = svg_data
-                display_and_store(fig, "02_figure_ground")
-                export_buttons("02_figure_ground", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "02_figure_ground", "Figure-Ground")
             except Exception as e:
                 st.error(f"Figure-Ground error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 3. POROSITY
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Porosity", anchor="porosity")
 
     if load_button("porosity", "Calculate Site Porosity"):
         with st.spinner("Calculating site density…"):
             try:
-                buildings      = fetch_buildings(lat, lon, radius)
-                buildings_proj = ox.projection.project_gdf(buildings)
-                total_area     = math.pi * radius ** 2
-                built_area     = buildings_proj.geometry.area.sum()
-                open_area      = total_area - built_area
-                built_pct      = int((built_area / total_area) * 100)
-                open_pct       = 100 - built_pct
+                buildings = fetch_buildings(lat, lon, radius)
+                buildings_p = ox.projection.project_gdf(buildings)
+                cx, cy = project_center(lat, lon, buildings_p.crs)
+
+                # Buildings are fetched in a square window: clip to the analysis circle
+                # and dissolve overlaps so built area can never exceed the site area.
+                circle     = Point(cx, cy).buffer(radius, resolution=64)
+                built_geom = unary_union(buildings_p.geometry.buffer(0)).intersection(circle)
+                total_area = circle.area
+                built_area = built_geom.area
+                open_area  = total_area - built_area
+                built_pct  = int(min(100, max(0, round(built_area / total_area * 100))))
+                open_pct   = 100 - built_pct
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Total Site Area",  f"{int(total_area):,} m²")
@@ -946,26 +996,18 @@ if view_mode == "Sections":
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 4. MOBILITY NETWORK
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Mobility Network", anchor="mobility-network")
 
     if load_button("mobility"):
         with st.spinner("Mapping streets and transit…"):
             try:
-                buildings      = fetch_buildings(lat, lon, radius)
-                edges, transit = fetch_access_points(lat, lon, radius)
-
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
-                transit_p   = transit.to_crs(target_crs) if transit is not None and not transit.empty else None
-
-                center_pt = gpd.GeoDataFrame(geometry=[Point(lon, lat)], crs="EPSG:4326")
-                center_p  = center_pt.to_crs(target_crs)
-                scx, scy  = center_p.geometry.iloc[0].x, center_p.geometry.iloc[0].y
+                buildings_p, edges_p, crs, scx, scy = load_base(lat, lon, radius)
+                _, transit = fetch_access_points(lat, lon, radius)
+                transit_p = transit.to_crs(crs) if transit is not None and not transit.empty else None
 
                 ROAD_COLORS = {
                     "motorway": "#E74C3C", "trunk": "#E74C3C", "primary":  "#E67E22",
@@ -983,17 +1025,17 @@ if view_mode == "Sections":
                     return DEFAULT_ROAD_COLOR
 
                 fig, ax = plt.subplots(figsize=(10, 10), facecolor="#1C1C2E")
-                ax.set_facecolor("#1C1C2E")
+                ax.set_facecolor("#1C1C2E")   # was an assignment that overwrote the method
 
-                edges_p["lw"]  = edges_p["highway"].apply(road_width) if "highway" in edges_p.columns else 1.0
-                edges_p["col"] = edges_p["highway"].apply(edge_color) if "highway" in edges_p.columns else DEFAULT_ROAD_COLOR
+                edges_p["lw"]  = edge_widths(edges_p)
+                edges_p["col"] = edges_p["highway"].apply(edge_color) \
+                    if "highway" in edges_p.columns else DEFAULT_ROAD_COLOR
                 for col_val in edges_p["col"].unique():
                     subset = edges_p[edges_p["col"] == col_val]
-                    # Use each edge's own width, not just the first row's — road types
-                    # sharing a color can still have different widths.
                     subset.plot(ax=ax, linewidth=subset["lw"], color=col_val, zorder=1)
 
-                buildings_p.plot(ax=ax, facecolor="#2C2C4E", edgecolor="#3D3D6B", linewidth=0.4, zorder=2)
+                buildings_p.plot(ax=ax, facecolor="#2C2C4E", edgecolor="#3D3D6B",
+                                 linewidth=0.4, zorder=2)
 
                 TRANSIT_STYLES = {
                     "bus_stop":        ("#F1C40F", "^", 120, "Bus Stop"),
@@ -1006,14 +1048,12 @@ if view_mode == "Sections":
                     "halt":            ("#9B59B6", "D", 140, "Train Halt"),
                     "tram_stop":       ("#1ABC9C", "^", 120, "Tram Stop"),
                     "subway_entrance": ("#E74C3C", "o", 120, "Subway Entrance"),
-                    "crossing":        ("#ECF0F1", "+",  80, "Pedestrian Crossing"),
+                    "crossing":        ("#ECF0F1", "P",  80, "Pedestrian Crossing"),
                     "traffic_signals": ("#2ECC71", "o",  60, "Traffic Signal"),
                 }
                 plotted_labels = {}
 
                 if transit_p is not None and not transit_p.empty:
-                    # Classify once, then batch one scatter() call per transit type
-                    # instead of one call per point.
                     by_label = {}
                     for geom, row in zip(transit_p.geometry.centroid, transit_p.itertuples()):
                         for field in ["highway", "railway", "amenity", "public_transport"]:
@@ -1029,72 +1069,59 @@ if view_mode == "Sections":
                                 break
 
                     for label, d in by_label.items():
-                        ax.scatter(d["xs"], d["ys"], color=d["color"], s=d["size"], marker=d["marker"],
-                                   edgecolor="white", linewidth=0.6, zorder=10, alpha=0.95)
+                        ax.scatter(d["xs"], d["ys"], color=d["color"], s=d["size"],
+                                   marker=d["marker"], edgecolor="white", linewidth=0.6,
+                                   zorder=10, alpha=0.95)
 
                 ax.scatter([scx], [scy], color="white", s=220, marker="*",
                            edgecolor="#E74C3C", linewidth=1.5, zorder=15)
 
-                road_legend = [Line2D([0],[0], color=c, lw=2, label=l) for c, l in [
-                    ("#E74C3C","Primary"), ("#E67E22","Secondary"), ("#F1C40F","Tertiary"),
-                    ("#AED6F1","Residential"), ("#A9CCE3","Path"),
+                road_legend = [Line2D([0], [0], color=c, lw=2, label=l) for c, l in [
+                    ("#E74C3C", "Primary"), ("#E67E22", "Secondary"), ("#F1C40F", "Tertiary"),
+                    ("#AED6F1", "Residential"), ("#A9CCE3", "Path"),
                 ]]
                 transit_legend = [
-                    Line2D([0],[0], marker=mk, color="w", markerfacecolor=c,
+                    Line2D([0], [0], marker=mk, color="w", markerfacecolor=c,
                            markersize=8, label=lbl, linestyle="None")
                     for lbl, (c, mk) in plotted_labels.items()
-                ] + [Line2D([0],[0], marker="*", color="w", markerfacecolor="white",
+                ] + [Line2D([0], [0], marker="*", color="w", markerfacecolor="white",
                             markersize=10, label="Site", linestyle="None")]
                 ax.legend(handles=road_legend + transit_legend, loc="upper right",
                           frameon=True, facecolor="#1C1C2E", labelcolor="white", fontsize=7.5)
                 set_site_extent(ax, scx, scy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["04_mobility.svg"] = svg_data
-                display_and_store(fig, "04_mobility")
-                export_buttons("04_mobility", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "04_mobility", "Mobility")
             except Exception as e:
                 st.error(f"Mobility error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 5. NEARBY LANDMARKS
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Nearby Landmarks", anchor="nearby-landmarks")
 
     if load_button("landmarks"):
         with st.spinner("Mapping amenities…"):
             try:
-                buildings   = fetch_buildings(lat, lon, radius)
-                edges       = fetch_graph(lat, lon, radius)
+                buildings_p, edges_p, crs, scx, scy = load_base(lat, lon, radius)
                 landmarks   = fetch_landmarks(lat, lon, radius)
-
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
-                landmarks_p = landmarks.to_crs(target_crs) if not landmarks.empty else landmarks
-
-                center_pt = gpd.GeoDataFrame(geometry=[Point(lon, lat)], crs="EPSG:4326")
-                center_p  = center_pt.to_crs(target_crs)
-                scx, scy  = center_p.geometry.iloc[0].x, center_p.geometry.iloc[0].y
+                landmarks_p = landmarks.to_crs(crs) if not landmarks.empty else landmarks
 
                 fig, ax = plt.subplots(figsize=(11, 11), facecolor="#F8F9FA")
                 ax.set_facecolor("#F8F9FA")
 
-                edges_p["lw"] = edges_p["highway"].apply(lambda x: road_width(x, scale=0.7)) if "highway" in edges_p.columns else 0.8
+                edges_p["lw"] = edge_widths(edges_p, 0.7, 0.8 / 0.7)
                 edges_p.plot(ax=ax, linewidth=edges_p["lw"], color="#CCD1D1", zorder=1)
-                buildings_p.plot(ax=ax, facecolor="#E8EAED", edgecolor="#BFC9CA", linewidth=0.3, zorder=2)
+                buildings_p.plot(ax=ax, facecolor="#E8EAED", edgecolor="#BFC9CA",
+                                 linewidth=0.3, zorder=2)
 
                 counts_by_cat  = {}
                 legend_entries = {}
 
                 if not landmarks_p.empty:
-                    # Classify once, then batch one scatter() call per category
-                    # instead of one call per point (much faster for dense areas).
                     by_cat = {}
                     for geom, row in zip(landmarks_p.geometry.centroid, landmarks_p.itertuples()):
                         cat, color, marker = classify_landmark(row)
@@ -1112,19 +1139,17 @@ if view_mode == "Sections":
                            edgecolor="white", linewidth=1.5, zorder=15)
 
                 handles = [
-                    Line2D([0],[0], marker=mk, color="w", markerfacecolor=c,
+                    Line2D([0], [0], marker=mk, color="w", markerfacecolor=c,
                            markersize=10, label=lbl, linestyle="None")
                     for lbl, (c, mk) in sorted(legend_entries.items())
                 ]
-                ax.legend(handles=handles, loc="upper right", frameon=True, facecolor="white", fontsize=8)
+                if handles:
+                    ax.legend(handles=handles, loc="upper right", frameon=True,
+                              facecolor="white", fontsize=8)
                 set_site_extent(ax, scx, scy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["05_landmarks.svg"] = svg_data
-                display_and_store(fig, "05_landmarks")
-                export_buttons("05_landmarks", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "05_landmarks", "Landmarks")
 
                 cols = st.columns(4)
                 for i, (cat, cnt) in enumerate(sorted(counts_by_cat.items())):
@@ -1134,46 +1159,36 @@ if view_mode == "Sections":
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 6. ENVIRONMENTAL SYNTHESIS
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Environmental Synthesis", anchor="environmental-synthesis")
 
     if load_button("synthesis"):
         with st.spinner("Layering environmental data…"):
             try:
-                buildings  = fetch_buildings(lat, lon, radius)
-                buildings  = buildings[buildings.geom_type.isin(["Polygon", "MultiPolygon"])]
-                edges      = fetch_graph(lat, lon, radius)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
                 wind_dirs, wind_speeds = fetch_wind_data(lat, lon)
                 waterways, water_bodies, elev_grid = fetch_flood_layers(lat, lon, radius)
-
-                buildings_proj = ox.projection.project_gdf(buildings)
-                target_crs     = buildings_proj.crs
-                edges_proj     = ox.projection.project_gdf(edges).to_crs(target_crs)
-                cx, cy         = project_center(lat, lon)
 
                 fig, ax = plt.subplots(figsize=(12, 12))
                 ax.set_facecolor("#F0F4F8")
 
                 if elev_grid is not None:
-                    proj   = get_utm_proj(lat, lon)
-                    xs_all = [proj(lo, la)[0] for la, lo in zip(elev_grid["lats"], elev_grid["lons"])]
-                    ys_all = [proj(lo, la)[1] for la, lo in zip(elev_grid["lats"], elev_grid["lons"])]
+                    xs_all, ys_all = lonlat_to_xy(elev_grid["lons"], elev_grid["lats"], crs)
                     zs_all = np.array(
                         [e if e is not None else float("nan")
                          for e in elev_grid["elevations"]], dtype=float)
-                    # Drop failed/NaN elevation samples before interpolating — a single
-                    # NaN in the input z-values makes cubic griddata return an all-NaN grid.
-                    valid  = ~np.isnan(zs_all)
+                    valid = ~np.isnan(zs_all)
                     if valid.sum() >= 4:
-                        xs = np.array(xs_all)[valid]
-                        ys = np.array(ys_all)[valid]
-                        zs = zs_all[valid]
+                        xs, ys, zs = xs_all[valid], ys_all[valid], zs_all[valid]
                         xi, yi = np.linspace(xs.min(), xs.max(), 120), np.linspace(ys.min(), ys.max(), 120)
                         Xi, Yi = np.meshgrid(xi, yi)
-                        Zi = griddata((xs, ys), zs, (Xi, Yi), method="cubic")
+                        try:
+                            Zi = griddata((xs, ys), zs, (Xi, Yi), method="cubic")
+                        except Exception:
+                            Zi = griddata((xs, ys), zs, (Xi, Yi), method="linear")
                         nan_mask = np.isnan(Zi)
                         if nan_mask.any():
                             Zi_nn = griddata((xs, ys), zs, (Xi, Yi), method="nearest")
@@ -1183,14 +1198,15 @@ if view_mode == "Sections":
                             (0.35, 0.65, 0.95, 0.35),
                             (0.85, 0.93, 1.0,  0.0),
                         ])
-                        cf   = ax.contourf(Xi, Yi, Zi, levels=12, cmap=flood_cmap,
-                                           vmin=np.nanmin(Zi), vmax=np.nanmax(Zi), zorder=0)
-                        cbar = plt.colorbar(cf, ax=ax, fraction=0.025, pad=0.01)
-                        cbar.set_label("Elevation (m)")
+                        if np.nanmax(Zi) - np.nanmin(Zi) > 1e-6:
+                            cf = ax.contourf(Xi, Yi, Zi, levels=12, cmap=flood_cmap,
+                                             vmin=np.nanmin(Zi), vmax=np.nanmax(Zi), zorder=0)
+                            cbar = plt.colorbar(cf, ax=ax, fraction=0.025, pad=0.01)
+                            cbar.set_label("Elevation (m)")
 
                 if water_bodies is not None and not water_bodies.empty:
                     try:
-                        water_bodies.to_crs(target_crs).plot(
+                        water_bodies.to_crs(crs).plot(
                             ax=ax, facecolor="#4A90D9", edgecolor="#2471A3",
                             linewidth=0.8, alpha=0.55, zorder=1)
                     except Exception:
@@ -1198,18 +1214,16 @@ if view_mode == "Sections":
 
                 if waterways is not None and not waterways.empty:
                     try:
-                        ww = waterways.to_crs(target_crs)
-                        ww["wlw"] = 1.5
-                        ww.plot(ax=ax, linewidth=ww["wlw"], color="#1A6FA8", alpha=0.85, zorder=2)
+                        waterways.to_crs(crs).plot(ax=ax, linewidth=1.5, color="#1A6FA8",
+                                                   alpha=0.85, zorder=2)
                     except Exception:
                         pass
 
-                edges_proj["w"] = edges_proj["highway"].apply(lambda x: road_width(x, scale=0.8)) if "highway" in edges_proj.columns else 1.2
-                edges_proj.plot(ax=ax, linewidth=edges_proj["w"], color="#B2BEC3", alpha=0.7, zorder=3)
-                buildings_proj.plot(ax=ax, facecolor="#DFE6E9", edgecolor="#636E72",
-                                    linewidth=0.4, alpha=0.9, zorder=4)
+                edges_p["w"] = edge_widths(edges_p, 0.8, 1.2 / 0.8)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#B2BEC3", alpha=0.7, zorder=3)
+                buildings_p.plot(ax=ax, facecolor="#DFE6E9", edgecolor="#636E72",
+                                 linewidth=0.4, alpha=0.9, zorder=4)
 
-                # Windrose Data
                 valid_dirs = [d for d in wind_dirs if d is not None]
                 n_sectors  = 16
                 sector_deg = 360.0 / n_sectors
@@ -1233,41 +1247,30 @@ if view_mode == "Sections":
                 set_site_extent(ax, cx, cy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["06_synthesis.svg"] = svg_data
-                display_and_store(fig, "06_synthesis")
-                export_buttons("06_synthesis", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "06_synthesis", "Synthesis")
             except Exception as e:
                 st.error(f"Synthesis error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 6.5 SUN PATH ANALYSIS
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Sun Path Analysis", anchor="sun-path-analysis")
 
     if load_button("sun_path"):
         with st.spinner("Mapping solar paths and directions…"):
             try:
-                buildings  = fetch_buildings(lat, lon, radius)
-                buildings  = buildings[buildings.geom_type.isin(["Polygon", "MultiPolygon"])]
-                edges      = fetch_graph(lat, lon, radius)
-
-                buildings_proj = ox.projection.project_gdf(buildings)
-                target_crs     = buildings_proj.crs
-                edges_proj     = ox.projection.project_gdf(edges).to_crs(target_crs)
-                cx, cy         = project_center(lat, lon)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
 
                 fig, ax = plt.subplots(figsize=(12, 12))
                 ax.set_facecolor("#F0F4F8")
 
-                edges_proj["w"] = edges_proj["highway"].apply(lambda x: road_width(x, scale=0.8)) if "highway" in edges_proj.columns else 1.2
-                edges_proj.plot(ax=ax, linewidth=edges_proj["w"], color="#B2BEC3", alpha=0.7, zorder=3)
-                buildings_proj.plot(ax=ax, facecolor="#DFE6E9", edgecolor="#636E72",
-                                    linewidth=0.4, alpha=0.9, zorder=4)
+                edges_p["w"] = edge_widths(edges_p, 0.8, 1.2 / 0.8)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#B2BEC3", alpha=0.7, zorder=3)
+                buildings_p.plot(ax=ax, facecolor="#DFE6E9", edgecolor="#636E72",
+                                 linewidth=0.4, alpha=0.9, zorder=4)
 
                 SUN_DATES = [
                     (datetime.date(2024, 6, 21),  "#FF7675", "Summer Solstice"),
@@ -1275,7 +1278,7 @@ if view_mode == "Sections":
                     (datetime.date(2024, 12, 21), "#74B9FF", "Winter Solstice"),
                 ]
                 for date, color, label in SUN_DATES:
-                    pts, _, _ = sun_path_points(lat, lon, date, radius)
+                    pts = sun_path_points(lat, lon, date, radius, cx, cy)
                     if len(pts) > 1:
                         ax.plot([p[1] for p in pts], [p[2] for p in pts],
                                 color=color, linewidth=2.5, linestyle="--", zorder=8, label=label)
@@ -1291,85 +1294,56 @@ if view_mode == "Sections":
                 set_site_extent(ax, cx, cy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["06b_sun_path.svg"] = svg_data
-                display_and_store(fig, "06b_sun_path")
-                export_buttons("06b_sun_path", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "06b_sun_path", "Sun Path")
             except Exception as e:
                 st.error(f"Sun Path error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 7. MASSING HEATMAP
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Massing Heatmap", anchor="massing-heatmap")
 
     if load_button("massing"):
         with st.spinner("Extracting building heights…"):
             try:
-                buildings      = fetch_buildings(lat, lon, radius)
-                buildings_proj = ox.projection.project_gdf(buildings)
-                target_crs     = buildings_proj.crs
-                edges          = fetch_graph(lat, lon, radius)
-                edges_proj     = ox.projection.project_gdf(edges).to_crs(target_crs)
-
-                def calculate_heights(df):
-                    heights = []
-                    for idx, row in df.iterrows():
-                        h = 3.0
-                        if "height" in df.columns and pd.notnull(row["height"]):
-                            try:
-                                h = float(str(row["height"]).replace("m","").replace(",",".").strip())
-                                heights.append(h); continue
-                            except ValueError: pass
-                        if "building:levels" in df.columns and pd.notnull(row["building:levels"]):
-                            try:
-                                h = float(str(row["building:levels"]).strip()) * 3.0
-                                heights.append(h); continue
-                            except ValueError: pass
-                        heights.append(h)
-                    return heights
-
-                buildings_proj["calc_height"] = calculate_heights(buildings_proj)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
+                buildings_p["calc_height"] = building_heights(buildings_p, 3.0)
 
                 fig, ax = plt.subplots(figsize=(12, 12), facecolor="#F8F9FA")
                 ax.set_facecolor("#F8F9FA")
 
-                edges_proj["w"] = edges_proj["highway"].apply(lambda x: road_width(x, scale=0.6)) if "highway" in edges_proj.columns else 0.8
-                edges_proj.plot(ax=ax, linewidth=edges_proj["w"], color="#CCD1D1", zorder=1)
-                buildings_proj.plot(ax=ax, column="calc_height", cmap="magma_r",
-                                    edgecolor="#BDC3C7", linewidth=0.3, legend=False, zorder=2)
+                edges_p["w"] = edge_widths(edges_p, 0.6, 0.8 / 0.6)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#CCD1D1", zorder=1)
+
+                hmin = float(buildings_p["calc_height"].min())
+                hmax = float(buildings_p["calc_height"].max())
+                if hmax <= hmin:
+                    hmax = hmin + 1.0
+                norm = plt.Normalize(vmin=hmin, vmax=hmax)
+                buildings_p.plot(ax=ax, column="calc_height", cmap="magma_r", norm=norm,
+                                 edgecolor="#BDC3C7", linewidth=0.3, legend=False, zorder=2)
 
                 divider = make_axes_locatable(ax)
                 cax     = divider.append_axes("right", size="3%", pad=0.1)
-                sm      = plt.cm.ScalarMappable(
-                    cmap="magma_r",
-                    norm=plt.Normalize(
-                        vmin=buildings_proj["calc_height"].min(),
-                        vmax=buildings_proj["calc_height"].max()))
-                sm._A = []
-                cbar  = fig.colorbar(sm, cax=cax)
+                sm      = plt.cm.ScalarMappable(cmap="magma_r", norm=norm)
+                sm.set_array([])
+                cbar = fig.colorbar(sm, cax=cax)
                 cbar.set_label("Building Height (m)", rotation=270, labelpad=15, fontweight="bold")
-                cx, cy = project_center(lat, lon)
                 set_site_extent(ax, cx, cy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["07_massing_heatmap.svg"] = svg_data
-                display_and_store(fig, "07_massing_heatmap")
-                export_buttons("07_massing_heatmap", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "07_massing_heatmap", "Massing")
             except Exception as e:
                 st.error(f"Massing heatmap error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 8. 3D SHADOW STUDY
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("3D Shadow Study", anchor="3d-shadow-study")
     st.markdown("Adjust the time of day to visualize dynamic sun shading across the site's urban massing.")
@@ -1379,7 +1353,7 @@ if view_mode == "Sections":
         shadow_date = st.date_input("Date for Sun Path", datetime.date(2024, 6, 21))
     with col2:
         shadow_time = st.slider(
-            "Time of Day",
+            "Time of Day (local solar zone)",
             min_value=datetime.time(6, 0),
             max_value=datetime.time(18, 0),
             value=datetime.time(12, 0),
@@ -1389,29 +1363,12 @@ if view_mode == "Sections":
     if load_button("shadow"):
         with st.spinner("Projecting 3D shadows…"):
             try:
-                from shapely.affinity import translate
-                from shapely.ops import unary_union
+                buildings = fetch_buildings(lat, lon, radius).copy()
+                buildings["calc_height"] = building_heights(buildings, 15.0)
 
-                buildings = fetch_buildings(lat, lon, radius)
-
-                def get_h(row):
-                    if "height" in row and pd.notnull(row["height"]):
-                        try:
-                            return float(str(row["height"]).replace("m","").replace(",",".").strip())
-                        except ValueError: pass
-                    if "building:levels" in row and pd.notnull(row["building:levels"]):
-                        try:
-                            return float(str(row["building:levels"]).strip()) * 3.0
-                        except ValueError: pass
-                    return 15.0
-
-                buildings["calc_height"] = buildings.apply(get_h, axis=1)
-
-                loc      = LocationInfo("Site", "Region", "UTC", lat, lon)
-                dt_local = datetime.datetime.combine(
-                    shadow_date, shadow_time,
-                    tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
-                )
+                tz  = site_tz(lon)
+                loc = LocationInfo("Site", "Region", "UTC", lat, lon)
+                dt_local = datetime.datetime.combine(shadow_date, shadow_time, tzinfo=tz)
                 el        = elevation(loc.observer, dt_local)
                 az        = azimuth(loc.observer, dt_local)
                 sun_is_up = el > 2
@@ -1424,13 +1381,12 @@ if view_mode == "Sections":
 
                 if sun_is_up:
                     for _, row in buildings_proj.iterrows():
-                        h          = row["calc_height"]
-                        shadow_len = h / math.tan(el_rad)
-                        dx         = -math.sin(az_rad) * shadow_len
-                        dy         = -math.cos(az_rad) * shadow_len
-                        geom       = row.geometry
+                        geom = row.geometry
                         if geom is None or geom.is_empty: continue
-                        shadow_geoms.append(unary_union([geom, translate(geom, xoff=dx, yoff=dy)]))
+                        shadow_len = row["calc_height"] / math.tan(el_rad)
+                        dx = -math.sin(az_rad) * shadow_len
+                        dy = -math.cos(az_rad) * shadow_len
+                        shadow_geoms.append(shadow_polygon(geom, dx, dy))
 
                 if shadow_geoms:
                     shadow_gdf  = gpd.GeoDataFrame(geometry=shadow_geoms, crs=target_crs).to_crs("EPSG:4326")
@@ -1438,42 +1394,35 @@ if view_mode == "Sections":
                 else:
                     shadow_dict = {"type": "FeatureCollection", "features": []}
 
-                sun_path_coords = []
-                sun_arc_radius  = radius * 0.72
+                m_per_deg_lon = 111320 * math.cos(math.radians(lat))
+                sun_arc_radius = radius * 0.72
 
+                def sun_pos(az_deg, el_deg, r):
+                    a = math.radians(az_deg)
+                    k = 1 - el_deg / 90
+                    return [lon + (r / m_per_deg_lon) * math.sin(a) * k,
+                            lat + (r / 111320) * math.cos(a) * k]
+
+                sun_path_coords = []
                 for h_i in range(6, 19):
                     for m_i in [0, 10, 20, 30, 40, 50]:
-                        t = datetime.datetime.combine(
-                            shadow_date, datetime.time(h_i, m_i),
-                            tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
-                        )
+                        t = datetime.datetime.combine(shadow_date, datetime.time(h_i, m_i), tzinfo=tz)
                         el_i = elevation(loc.observer, t)
-                        az_i = azimuth(loc.observer, t)
                         if el_i <= 0: continue
-                        az_i_rad = math.radians(az_i)
-                        sun_path_coords.append([
-                            lon + (sun_arc_radius / (111320 * math.cos(math.radians(lat)))) * math.sin(az_i_rad) * (1 - el_i / 90),
-                            lat + (sun_arc_radius / 111320) * math.cos(az_i_rad) * (1 - el_i / 90),
-                        ])
+                        sun_path_coords.append(sun_pos(azimuth(loc.observer, t), el_i, sun_arc_radius))
 
                 key_sun_points = []
-                for h_i in [6, shadow_time.hour, 18]:
-                    t = datetime.datetime.combine(
-                        shadow_date, datetime.time(h_i, 0),
-                        tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
-                    )
+                for h_i in sorted({6, shadow_time.hour, 18}):
+                    t = datetime.datetime.combine(shadow_date, datetime.time(h_i, 0), tzinfo=tz)
                     el_i = elevation(loc.observer, t)
-                    az_i = azimuth(loc.observer, t)
                     if el_i <= 0: continue
-                    az_i_rad = math.radians(az_i)
-                    is_cur   = (h_i == shadow_time.hour)
-                    ampm     = "AM" if h_i < 12 else "PM"
+                    az_i   = azimuth(loc.observer, t)
+                    is_cur = (h_i == shadow_time.hour)
+                    ampm   = "AM" if h_i < 12 else "PM"
+                    h12    = h_i if h_i <= 12 else h_i - 12
                     key_sun_points.append({
-                        "position": [
-                            lon + (sun_arc_radius / (111320 * math.cos(math.radians(lat)))) * math.sin(az_i_rad) * (1 - el_i / 90),
-                            lat + (sun_arc_radius / 111320) * math.cos(az_i_rad) * (1 - el_i / 90),
-                        ],
-                        "label":  f"{h_i if h_i <= 12 else h_i - 12}:00\n{ampm}",
+                        "position": sun_pos(az_i, el_i, sun_arc_radius),
+                        "label":  f"{h12}:00 {ampm}",
                         "size":   16 if is_cur else 11,
                         "color":  [255, 225, 0, 255] if is_cur else [255, 225, 0, 160],
                         "radius": 18 if is_cur else 10,
@@ -1481,19 +1430,19 @@ if view_mode == "Sections":
 
                 cardinal_r = sun_arc_radius * 1.18
                 cardinals  = [
-                    {
-                        "position": [
-                            lon + (cardinal_r / (111320 * math.cos(math.radians(lat)))) * math.sin(math.radians(az_c)),
-                            lat + (cardinal_r / 111320) * math.cos(math.radians(az_c)),
-                        ],
-                        "label": lbl,
-                    }
+                    {"position": [
+                        lon + (cardinal_r / m_per_deg_lon) * math.sin(math.radians(az_c)),
+                        lat + (cardinal_r / 111320) * math.cos(math.radians(az_c)),
+                     ], "label": lbl}
                     for lbl, az_c in [("N", 0), ("E", 90), ("S", 180), ("W", 270)]
                 ]
 
-                buildings_dict = json.loads(buildings[["geometry", "calc_height"]].to_json())
-                brightness     = int(max(180, min(230, 180 + el * 0.8))) if sun_is_up else 160
-                fill_color     = [brightness, brightness - 8, brightness - 15, 255]
+                # reset_index: OSM features have a (element_type, osmid) MultiIndex,
+                # which GeoDataFrame.to_json cannot serialise reliably.
+                buildings_dict = json.loads(
+                    buildings[["geometry", "calc_height"]].reset_index(drop=True).to_json())
+                brightness = int(max(180, min(230, 180 + el * 0.8))) if sun_is_up else 160
+                fill_color = [brightness, brightness - 8, brightness - 15, 255]
 
                 shadow_layer = pdk.Layer(
                     "GeoJsonLayer", data=shadow_dict,
@@ -1530,7 +1479,7 @@ if view_mode == "Sections":
                     "TextLayer", data=cardinals,
                     get_position="position", get_text="label",
                     get_size=16, get_color=[140, 130, 115, 200],
-                    get_weight=700, pickable=False, billboard=False,
+                    font_weight=700, pickable=False, billboard=False,
                 )
 
                 view_state = pdk.ViewState(
@@ -1541,8 +1490,7 @@ if view_mode == "Sections":
                     layers=[shadow_layer, building_layer, sun_path_layer,
                             sun_label_layer, sun_dot_layer, cardinal_layer],
                     initial_view_state=view_state,
-                    map_provider="carto",
-                    map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+                    map_provider=None,
                 )
 
                 st.pydeck_chart(r)
@@ -1563,9 +1511,9 @@ if view_mode == "Sections":
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 9. LAND USE MAP
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Land Use", anchor="land-use")
     st.caption("OSM landuse, leisure, amenity, and natural polygons classified by use type.")
@@ -1573,104 +1521,73 @@ if view_mode == "Sections":
     if load_button("land_use", "Map Land Use"):
         with st.spinner("Classifying land parcels…"):
             try:
-                buildings  = fetch_buildings(lat, lon, radius)
-                edges      = fetch_graph(lat, lon, radius)
-                land_use   = fetch_land_use(lat, lon, radius)
-
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
+                buildings_p, edges_p, crs, scx, scy = load_base(lat, lon, radius)
+                land_use = fetch_land_use(lat, lon, radius)
 
                 fig, ax = plt.subplots(figsize=(12, 12), facecolor="#F0F0EE")
-                ax.set_facecolor("#F0F0EE")  # warm neutral for unclassified ground
+                ax.set_facecolor("#F0F0EE")
 
                 legend_entries = {}
                 counts = {}
 
                 if land_use is not None and not land_use.empty:
-                    land_use_p = land_use.to_crs(target_crs)
+                    land_use_p = land_use.to_crs(crs).copy()
 
-                    # Assign category to every feature once
-                    categories = []
-                    for row in land_use_p.itertuples():
-                        color, label = classify_land_use(row)
-                        categories.append((label, color))
+                    cats = [classify_land_use(row) for row in land_use_p.itertuples()]
+                    land_use_p["_cat_color"] = [c[0] for c in cats]
+                    land_use_p["_cat_label"] = [c[1] for c in cats]
+
+                    # Water is drawn by the flood map; drop it *before* building the legend
+                    land_use_p = land_use_p[~land_use_p["_cat_label"].isin(WATER_LABELS)]
+
+                    for color, label in zip(land_use_p["_cat_color"], land_use_p["_cat_label"]):
                         legend_entries[label] = color
                         counts[label] = counts.get(label, 0) + 1
 
-                    land_use_p = land_use_p.copy()
-                    land_use_p["_cat_color"] = [c[1] for c in categories]
-                    land_use_p["_cat_label"] = [c[0] for c in categories]
-
-                    # --- NEW: Filter out water categories ---
-                    water_labels = ["Water", "Water Basin", "Reservoir", "Wetland", "Floodplain"]
-                    land_use_p = land_use_p[~land_use_p["_cat_label"].isin(water_labels)]
-                    # ----------------------------------------
-
-                    # Batch-plot per colour bucket (much faster than per-row)
                     for color in land_use_p["_cat_color"].unique():
                         subset = land_use_p[land_use_p["_cat_color"] == color]
                         subset.plot(ax=ax, facecolor=color, edgecolor="white",
                                     linewidth=0.3, alpha=0.75, zorder=1)
 
-                # Roads as clean white lines — read hierarchy for width
-                edges_p["w"] = edges_p["highway"].apply(
-                    lambda x: road_width(x, scale=0.9)) if "highway" in edges_p.columns else 1.0
-                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="white",
-                             alpha=0.9, zorder=3)
-                # Thin road edge casing for definition
+                edges_p["w"] = edge_widths(edges_p, 0.9)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="white", alpha=0.9, zorder=3)
                 edges_p.plot(ax=ax, linewidth=edges_p["w"] * 2.2, color="#BBBBBB",
                              alpha=0.25, zorder=2)
 
-                # Buildings as dark fills — prominent but not overwhelming
                 buildings_p.plot(ax=ax, facecolor="#3D3D3D", edgecolor="none",
                                  alpha=0.70, zorder=4)
 
-                # Site marker
-                center_pt = gpd.GeoDataFrame(geometry=[Point(lon, lat)], crs="EPSG:4326")
-                center_p  = center_pt.to_crs(target_crs)
-                scx       = center_p.geometry.iloc[0].x
-                scy       = center_p.geometry.iloc[0].y
                 ax.scatter([scx], [scy], color="white", s=260, marker="*",
                            edgecolor="#E74C3C", linewidth=2.0, zorder=15)
 
-                # Legend — sorted by count desc
-                sorted_cats = sorted(legend_entries.items(),
-                                     key=lambda kv: -counts.get(kv[0], 0))
+                sorted_cats = sorted(legend_entries.items(), key=lambda kv: -counts.get(kv[0], 0))
                 handles = [
-                    Patch(facecolor=c, edgecolor="#AAAAAA", label=lbl,
-                          linewidth=0.4, alpha=0.85)
+                    Patch(facecolor=c, edgecolor="#AAAAAA", label=lbl, linewidth=0.4, alpha=0.85)
                     for lbl, c in sorted_cats
-                ] + [Line2D([0],[0], marker="*", color="w", markerfacecolor="white",
+                ] + [Line2D([0], [0], marker="*", color="w", markerfacecolor="white",
                             markersize=10, label="Site", linestyle="None",
                             markeredgecolor="#E74C3C")]
                 ax.legend(handles=handles, loc="upper right", frameon=True,
                           facecolor="white", fontsize=7, ncol=2,
-                          edgecolor="#DDDDDD", title="Land Use",
-                          title_fontsize=7)
+                          edgecolor="#DDDDDD", title="Land Use", title_fontsize=7)
                 set_site_extent(ax, scx, scy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["09_land_use.svg"] = svg_data
-                display_and_store(fig, "09_land_use")
-                export_buttons("09_land_use", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "09_land_use", "Land Use")
 
                 if counts:
                     st.caption("Parcel counts by land use category")
                     cols = st.columns(4)
-                    for i, (cat, cnt) in enumerate(
-                            sorted(counts.items(), key=lambda x: -x[1])[:12]):
+                    for i, (cat, cnt) in enumerate(sorted(counts.items(), key=lambda x: -x[1])[:12]):
                         cols[i % 4].metric(cat, cnt)
             except Exception as e:
                 st.error(f"Land Use error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 10. UTILITY INFRASTRUCTURE
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Utility Infrastructure", anchor="utility-lines")
     st.caption("Street-level electrical poles/cables, sewer/drain lines, water supply, and telecom from OSM.")
@@ -1678,22 +1595,14 @@ if view_mode == "Sections":
     if load_button("utilities", "Map Utilities"):
         with st.spinner("Tracing utility networks…"):
             try:
-                buildings  = fetch_buildings(lat, lon, radius)
-                edges      = fetch_graph(lat, lon, radius)
-                util_data  = fetch_utilities(lat, lon, radius)
-
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
+                buildings_p, edges_p, crs, scx, scy = load_base(lat, lon, radius)
+                util_data = fetch_utilities(lat, lon, radius)
 
                 fig, ax = plt.subplots(figsize=(12, 12), facecolor="#1A1A2E")
                 ax.set_facecolor("#1A1A2E")
 
-                # Base: muted road + building layer
-                edges_p["w"] = edges_p["highway"].apply(
-                    lambda x: road_width(x, scale=0.55)) if "highway" in edges_p.columns else 0.6
-                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#2C2C4E",
-                             alpha=0.85, zorder=1)
+                edges_p["w"] = edge_widths(edges_p, 0.55)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#2C2C4E", alpha=0.85, zorder=1)
                 buildings_p.plot(ax=ax, facecolor="#16213E", edgecolor="#1a2a50",
                                  linewidth=0.3, alpha=0.95, zorder=2)
 
@@ -1707,70 +1616,51 @@ if view_mode == "Sections":
 
                     lines  = gdf[gdf.geom_type.isin(["LineString", "MultiLineString"])]
                     points = gdf[gdf.geom_type == "Point"]
-
                     added_to_legend = False
 
-                    # --- NEW: Synthesize connecting lines for power poles ---
-                    if util_key == "power" and not points.empty:
-                        pts_p = points.to_crs(target_crs)
-                        coords = np.array([(geom.x, geom.y) for geom in pts_p.geometry])
-
-                        if len(coords) > 1:
-                            tree = cKDTree(coords)
-                            # Connect poles within 65 meters of each other
-                            pairs = tree.query_pairs(r=65.0)
-                            synth_lines = [LineString([coords[i], coords[j]]) for i, j in pairs]
-
-                            if synth_lines:
-                                synth_gdf = gpd.GeoDataFrame(geometry=synth_lines, crs=target_crs)
-                                synth_gdf.plot(ax=ax, linewidth=lw*0.8, color=lc, linestyle=ls, alpha=0.7, zorder=4)
-                                if not added_to_legend:
-                                    legend_lines.append(Line2D([0],[0], color=lc, lw=lw, linestyle=ls, label=label))
-                                    added_to_legend = True
-                    # --------------------------------------------------------
+                    # Poles are only nodes in OSM: join nearby ones to suggest the line route
+                    if util_key == "power" and len(points) > 1:
+                        pts_p  = points.to_crs(crs)
+                        coords = np.array([(g.x, g.y) for g in pts_p.geometry])
+                        pairs  = cKDTree(coords).query_pairs(r=65.0)
+                        synth_lines = [LineString([coords[i], coords[j]]) for i, j in pairs]
+                        if synth_lines:
+                            gpd.GeoDataFrame(geometry=synth_lines, crs=crs).plot(
+                                ax=ax, linewidth=lw * 0.8, color=lc, linestyle=ls,
+                                alpha=0.7, zorder=4)
+                            legend_lines.append(Line2D([0], [0], color=lc, lw=lw, linestyle=ls, label=label))
+                            added_to_legend = True
+                            plotted_any = True
 
                     if not lines.empty:
-                        lines_p = lines.to_crs(target_crs)
-                        lines_p.plot(ax=ax, linewidth=lw, color=lc,
-                                     linestyle=ls, alpha=0.92, zorder=5)
+                        lines.to_crs(crs).plot(ax=ax, linewidth=lw, color=lc,
+                                               linestyle=ls, alpha=0.92, zorder=5)
                         if not added_to_legend:
-                            legend_lines.append(
-                                Line2D([0],[0], color=lc, lw=lw, linestyle=ls, label=label))
+                            legend_lines.append(Line2D([0], [0], color=lc, lw=lw, linestyle=ls, label=label))
                             added_to_legend = True
                         plotted_any = True
 
                     if not points.empty:
-                        pts_p = points.to_crs(target_crs)
-                        # Filter to only point geometries (some may have centroids of poly)
-                        px = pts_p.geometry.centroid.x
-                        py = pts_p.geometry.centroid.y
-                        ax.scatter(px, py, color=pc, s=ps, marker=pm,
-                                   edgecolor="white", linewidth=0.4,
-                                   zorder=10, alpha=0.95)
+                        pts_p = points.to_crs(crs)
+                        ax.scatter(pts_p.geometry.x, pts_p.geometry.y, color=pc, s=ps, marker=pm,
+                                   edgecolor="white", linewidth=0.4, zorder=10, alpha=0.95)
                         if not added_to_legend:
                             legend_lines.append(
-                                Line2D([0],[0], marker=pm, color="w",
-                                       markerfacecolor=pc, markersize=7,
-                                       label=label, linestyle="None"))
+                                Line2D([0], [0], marker=pm, color="w", markerfacecolor=pc,
+                                       markersize=7, label=label, linestyle="None"))
                             added_to_legend = True
                         plotted_any = True
 
-                # Site marker
-                center_pt = gpd.GeoDataFrame(geometry=[Point(lon, lat)], crs="EPSG:4326")
-                center_p  = center_pt.to_crs(target_crs)
-                scx       = center_p.geometry.iloc[0].x
-                scy       = center_p.geometry.iloc[0].y
                 ax.scatter([scx], [scy], color="white", s=240, marker="*",
                            edgecolor="#E74C3C", linewidth=1.5, zorder=15)
                 legend_lines.append(
-                    Line2D([0],[0], marker="*", color="w", markerfacecolor="white",
+                    Line2D([0], [0], marker="*", color="w", markerfacecolor="white",
                            markersize=10, label="Site", linestyle="None",
                            markeredgecolor="#E74C3C"))
 
-                if legend_lines:
-                    ax.legend(handles=legend_lines, loc="upper right", frameon=True,
-                              facecolor="#1A1A2E", labelcolor="white", fontsize=8,
-                              edgecolor="#333355")
+                ax.legend(handles=legend_lines, loc="upper right", frameon=True,
+                          facecolor="#1A1A2E", labelcolor="white", fontsize=8,
+                          edgecolor="#333355")
                 set_site_extent(ax, scx, scy, radius)
                 ax.set_axis_off()
 
@@ -1780,19 +1670,15 @@ if view_mode == "Sections":
                         "OSM utility coverage is best in dense urban cores — try increasing "
                         "the radius, or the area may not have utility tagging yet.")
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["10_utilities.svg"] = svg_data
-                display_and_store(fig, "10_utilities")
-                export_buttons("10_utilities", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "10_utilities", "Utilities")
             except Exception as e:
                 st.error(f"Utilities error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 11. FLOOD RISK MAP
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Flood Risk", anchor="flood-risk")
     st.caption("Elevation-derived inundation risk, OSM waterways, and flood-prone land use zones.")
@@ -1800,42 +1686,30 @@ if view_mode == "Sections":
     if load_button("flood_map", "Generate Flood Map"):
         with st.spinner("Analysing flood risk layers…"):
             try:
-                buildings                                          = fetch_buildings(lat, lon, radius)
-                edges                                              = fetch_graph(lat, lon, radius)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
                 waterways, water_bodies, elev_grid = fetch_flood_layers(lat, lon, radius)
-                land_use                                           = fetch_land_use(lat, lon, radius)
-
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
-
-                proj   = get_utm_proj(lat, lon)
-                cx, cy = proj(lon, lat)
+                land_use = fetch_land_use(lat, lon, radius)
 
                 fig, ax = plt.subplots(figsize=(12, 12), facecolor="#EAF4FB")
                 ax.set_facecolor("#EAF4FB")
 
                 elev_min = elev_max = None
-                xs_v = ys_v = zs_v = None  # for building risk colouring
+                xs_v = ys_v = zs_v = None
 
                 if elev_grid is not None:
-                    xs  = [proj(lo, la)[0] for la, lo in zip(elev_grid["lats"], elev_grid["lons"])]
-                    ys  = [proj(lo, la)[1] for la, lo in zip(elev_grid["lats"], elev_grid["lons"])]
-                    zs  = np.array(
+                    xs, ys = lonlat_to_xy(elev_grid["lons"], elev_grid["lats"], crs)
+                    zs = np.array(
                         [e if e is not None else float("nan")
                          for e in elev_grid["elevations"]], dtype=float)
                     valid = ~np.isnan(zs)
                     if valid.sum() >= 9:
-                        xs_a = np.array(xs)[valid]
-                        ys_a = np.array(ys)[valid]
-                        zs_a = zs[valid]
+                        xs_a, ys_a, zs_a = xs[valid], ys[valid], zs[valid]
 
                         pad  = (xs_a.max() - xs_a.min()) * 0.02
                         xi   = np.linspace(xs_a.min() - pad, xs_a.max() + pad, 250)
                         yi   = np.linspace(ys_a.min() - pad, ys_a.max() + pad, 250)
                         Xi, Yi = np.meshgrid(xi, yi)
 
-                        # Linear interp + nearest fallback to avoid NaN blowup
                         Zi = griddata((xs_a, ys_a), zs_a, (Xi, Yi), method="linear")
                         nan_mask = np.isnan(Zi)
                         if nan_mask.any():
@@ -1846,47 +1720,43 @@ if view_mode == "Sections":
                         elev_max = float(np.nanmax(Zi))
                         xs_v, ys_v, zs_v = xs_a, ys_a, zs_a
 
-                        flood_cmap = LinearSegmentedColormap.from_list("flood_risk", [
-                            "#08306B", "#1565C0", "#1976D2",
-                            "#42A5F5", "#90CAF9", "#BBDEFB", "#F5F9FF",
-                        ])
-                        elev_range_c = max(elev_max - elev_min, 0.1)
-                        n_levels = min(16, max(6, int(elev_range_c * 2)))
-                        cf = ax.contourf(Xi, Yi, Zi, levels=n_levels,
-                                         cmap=flood_cmap, zorder=0, alpha=0.85)
-                        cs = ax.contour(Xi, Yi, Zi, levels=min(8, n_levels),
-                                        colors="#1A4D7A", linewidths=0.6,
-                                        alpha=0.55, zorder=1)
-                        try:
-                            ax.clabel(cs, inline=True, fontsize=6.5,
-                                      fmt="%.1f m", colors="#1A4D7A")
-                        except Exception:
-                            pass
-                        cbar = plt.colorbar(cf, ax=ax, fraction=0.025, pad=0.01)
-                        cbar.set_label("Elevation (m asl)", fontsize=8)
-                        cbar.ax.tick_params(labelsize=7)
+                        # Contours need a non-flat surface
+                        if elev_max - elev_min > 1e-6:
+                            flood_cmap = LinearSegmentedColormap.from_list("flood_risk", [
+                                "#08306B", "#1565C0", "#1976D2",
+                                "#42A5F5", "#90CAF9", "#BBDEFB", "#F5F9FF",
+                            ])
+                            n_levels = min(16, max(6, int((elev_max - elev_min) * 2)))
+                            cf = ax.contourf(Xi, Yi, Zi, levels=n_levels,
+                                             cmap=flood_cmap, zorder=0, alpha=0.85)
+                            try:
+                                cs = ax.contour(Xi, Yi, Zi, levels=min(8, n_levels),
+                                                colors="#1A4D7A", linewidths=0.6,
+                                                alpha=0.55, zorder=1)
+                                ax.clabel(cs, inline=True, fontsize=6.5,
+                                          fmt="%.1f m", colors="#1A4D7A")
+                            except Exception:
+                                pass
+                            cbar = plt.colorbar(cf, ax=ax, fraction=0.025, pad=0.01)
+                            cbar.set_label("Elevation (m asl)", fontsize=8)
+                            cbar.ax.tick_params(labelsize=7)
 
-                # Flood-prone land use
-                FLOOD_LANDUSE = {"floodplain", "basin", "reservoir",
-                                 "water", "wetland", "mud"}
+                FLOOD_LANDUSE = {"floodplain", "basin", "reservoir", "water", "wetland", "mud"}
                 if land_use is not None and not land_use.empty:
-                    flood_idx = []
+                    mask = []
                     for row in land_use.itertuples():
-                        for field in ["landuse", "natural", "water"]:
-                            val = str(getattr(row, field, "nan")).lower()
-                            if val in FLOOD_LANDUSE:
-                                flood_idx.append(row.Index)
-                                break
-                    if flood_idx:
-                        fz = land_use.loc[flood_idx]
-                        fz = fz[fz.geom_type.isin(["Polygon","MultiPolygon"])].to_crs(target_crs)
-                        if not fz.empty:
-                            fz.plot(ax=ax, facecolor="#1565C0", edgecolor="#0D47A1",
-                                    linewidth=0.7, alpha=0.45, zorder=2)
+                        mask.append(any(
+                            str(getattr(row, f, "nan")).lower() in FLOOD_LANDUSE
+                            for f in ["landuse", "natural", "water"]))
+                    fz = land_use[np.array(mask, dtype=bool)]
+                    fz = fz[fz.geom_type.isin(["Polygon", "MultiPolygon"])]
+                    if not fz.empty:
+                        fz.to_crs(crs).plot(ax=ax, facecolor="#1565C0", edgecolor="#0D47A1",
+                                            linewidth=0.7, alpha=0.45, zorder=2)
 
                 if water_bodies is not None and not water_bodies.empty:
                     try:
-                        water_bodies.to_crs(target_crs).plot(
+                        water_bodies.to_crs(crs).plot(
                             ax=ax, facecolor="#1976D2", edgecolor="#0D47A1",
                             linewidth=0.9, alpha=0.80, zorder=3)
                     except Exception:
@@ -1894,7 +1764,7 @@ if view_mode == "Sections":
 
                 if waterways is not None and not waterways.empty:
                     try:
-                        ww_p = waterways.to_crs(target_crs)
+                        ww_p = waterways.to_crs(crs).copy()
 
                         def ww_lw(val):
                             v = str(val[0] if isinstance(val, list) else val).lower()
@@ -1906,40 +1776,31 @@ if view_mode == "Sections":
                             if "waterway" in ww_p.columns else 1.5
                         for lw_val in ww_p["_lw"].unique():
                             ww_p[ww_p["_lw"] == lw_val].plot(
-                                ax=ax, linewidth=float(lw_val),
-                                color="#0D47A1", alpha=0.90, zorder=4)
+                                ax=ax, linewidth=float(lw_val), color="#0D47A1",
+                                alpha=0.90, zorder=4)
                     except Exception:
                         pass
 
-                edges_p["w"] = edges_p["highway"].apply(
-                    lambda x: road_width(x, scale=0.85)) if "highway" in edges_p.columns else 1.0
-                edges_p.plot(ax=ax, linewidth=edges_p["w"],
-                             color="#4A6080", alpha=0.55, zorder=5)
+                edges_p["w"] = edge_widths(edges_p, 0.85)
+                edges_p.plot(ax=ax, linewidth=edges_p["w"], color="#4A6080", alpha=0.55, zorder=5)
 
-                # Buildings — vectorised flood-risk tinting
-                if xs_v is not None and elev_min is not None:
-                    b_cx   = np.array([g.centroid.x for g in buildings_p.geometry])
-                    b_cy   = np.array([g.centroid.y for g in buildings_p.geometry])
+                if xs_v is not None and elev_min is not None and elev_max > elev_min:
+                    b_cx = np.array([g.centroid.x for g in buildings_p.geometry])
+                    b_cy = np.array([g.centroid.y for g in buildings_p.geometry])
                     b_elev = griddata((xs_v, ys_v), zs_v, (b_cx, b_cy), method="nearest")
-                    elev_range_b = max(elev_max - elev_min, 0.1)
-                    # 0 = low ground (risk), 1 = high ground (safe)
-                    safe = np.clip((b_elev - elev_min) / elev_range_b, 0.0, 1.0)
-                    # Colour: warm red for risk, cool grey-blue for safe
-                    r_ch = (0.78 + safe * 0.07).clip(0, 1)
-                    g_ch = (0.45 + safe * 0.37).clip(0, 1)
-                    b_ch = (0.50 + safe * 0.32).clip(0, 1)
-                    colors_arr = np.column_stack([r_ch, g_ch, b_ch,
-                                                   np.full(len(safe), 0.88)])
-                    # Bucket into ~10 risk bins to reduce plot calls
+                    safe = np.clip((b_elev - elev_min) / (elev_max - elev_min), 0.0, 1.0)
+                    r_ch = np.clip(0.78 + safe * 0.07, 0, 1)
+                    g_ch = np.clip(0.45 + safe * 0.37, 0, 1)
+                    b_ch = np.clip(0.50 + safe * 0.32, 0, 1)
+                    colors_arr = np.column_stack([r_ch, g_ch, b_ch, np.full(len(safe), 0.88)])
                     bins = np.round(safe * 9).astype(int)
                     buildings_reset = buildings_p.reset_index(drop=True)
                     for bin_val in range(10):
                         idx = np.where(bins == bin_val)[0]
                         if len(idx) == 0:
                             continue
-                        fc = tuple(colors_arr[idx[0]])
                         buildings_reset.iloc[idx].plot(
-                            ax=ax, facecolor=fc,
+                            ax=ax, facecolor=tuple(colors_arr[idx[0]]),
                             edgecolor="#4A6080", linewidth=0.2, zorder=6)
                 else:
                     buildings_p.plot(ax=ax, facecolor="#CFDBE8",
@@ -1953,8 +1814,8 @@ if view_mode == "Sections":
                     Patch(facecolor="#1565C0", alpha=0.45, label="Flood-prone Zone"),
                     Patch(facecolor="#DDA0A0", alpha=0.90, label="High Risk (low ground)"),
                     Patch(facecolor="#CFDBE8", alpha=0.90, label="Low Risk (high ground)"),
-                    Line2D([0],[0], color="#0D47A1", lw=2.0, label="Waterway / Drain"),
-                    Line2D([0],[0], marker="*", color="w", markerfacecolor="white",
+                    Line2D([0], [0], color="#0D47A1", lw=2.0, label="Waterway / Drain"),
+                    Line2D([0], [0], marker="*", color="w", markerfacecolor="white",
                            markersize=10, label="Site", linestyle="None",
                            markeredgecolor="#E74C3C"),
                 ]
@@ -1963,25 +1824,24 @@ if view_mode == "Sections":
                 set_site_extent(ax, cx, cy, radius)
                 ax.set_axis_off()
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["11_flood_risk.svg"] = svg_data
-                display_and_store(fig, "11_flood_risk")
-                export_buttons("11_flood_risk", fig, svg_data)
-                plt.close(fig)
+                finish_figure(fig, "11_flood_risk", "Flood Risk")
 
                 if elev_min is not None:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Min Elevation",   f"{elev_min:.1f} m")
                     c2.metric("Max Elevation",   f"{elev_max:.1f} m")
                     c3.metric("Elevation Range", f"{elev_max - elev_min:.1f} m")
+                elif elev_grid is None:
+                    st.warning("Elevation service (OpenTopoData) returned no data — "
+                               "elevation layers were skipped. Try again in a moment.")
             except Exception as e:
                 st.error(f"Flood Risk error: {e}")
 
     st.markdown("---")
 
-    # ==============================================================================
+    # ==========================================================================
     # 12. LAND TOPOGRAPHY
-    # ==============================================================================
+    # ==========================================================================
 
     st.header("Land Topography", anchor="land-topography")
     st.caption("High-resolution elevation surface with hillshade and slope analysis (dual-panel).")
@@ -1989,106 +1849,91 @@ if view_mode == "Sections":
     if load_button("topography", "Generate Topography Map"):
         with st.spinner("Fetching elevation surface — this may take ~20 s…"):
             try:
-                buildings = fetch_buildings(lat, lon, radius)
-                edges     = fetch_graph(lat, lon, radius)
-                topo      = fetch_topography_detailed(lat, lon, radius)
+                buildings_p, edges_p, crs, cx, cy = load_base(lat, lon, radius)
+                topo = fetch_topography_detailed(lat, lon, radius)
 
-                buildings_p = ox.projection.project_gdf(buildings)
-                target_crs  = buildings_p.crs
-                edges_p     = ox.projection.project_gdf(edges).to_crs(target_crs)
-
-                proj   = get_utm_proj(lat, lon)
-                cx, cy = proj(lon, lat)
-
-                xs = [proj(lo, la)[0] for la, lo in zip(topo["lats"], topo["lons"])]
-                ys = [proj(lo, la)[1] for la, lo in zip(topo["lats"], topo["lons"])]
+                xs, ys = lonlat_to_xy(topo["lons"], topo["lats"], crs)
                 zs = np.array(
                     [e if e is not None else float("nan")
                      for e in topo["elevations"]], dtype=float)
                 valid = ~np.isnan(zs)
 
-                fig, axes = plt.subplots(1, 2, figsize=(18, 9), facecolor="#F2F3F4")
+                surf = None
+                if valid.sum() >= 4:
+                    xi = np.linspace(xs[valid].min(), xs[valid].max(), 300)
+                    yi = np.linspace(ys[valid].min(), ys[valid].max(), 300)
+                    Xi, Yi = np.meshgrid(xi, yi)
+                    try:
+                        Zi = griddata((xs[valid], ys[valid]), zs[valid], (Xi, Yi), method="cubic")
+                    except Exception:
+                        Zi = griddata((xs[valid], ys[valid]), zs[valid], (Xi, Yi), method="linear")
+                    # Fill the NaN border left by cubic interpolation
+                    nan_mask = np.isnan(Zi)
+                    if nan_mask.any():
+                        Zi_nn = griddata((xs[valid], ys[valid]), zs[valid], (Xi, Yi), method="nearest")
+                        Zi[nan_mask] = Zi_nn[nan_mask]
+                    if np.nanmax(Zi) - np.nanmin(Zi) > 1e-6:
+                        surf = (xi, yi, Xi, Yi, Zi)
 
-                for ax_i, ax in enumerate(axes):
-                    ax.set_facecolor("#F2F3F4")
+                if surf is None:
+                    st.warning("Not enough elevation data returned (or terrain is flat) — "
+                               "try again in a moment or use a larger radius.")
+                else:
+                    xi, yi, Xi, Yi, Zi = surf
+                    dZdx = np.gradient(Zi, xi, axis=1)
+                    dZdy = np.gradient(Zi, yi, axis=0)
+                    slope_rad = np.arctan(np.sqrt(dZdx ** 2 + dZdy ** 2))
 
-                    if valid.sum() >= 4:
-                        xi  = np.linspace(min(np.array(xs)[valid]),
-                                          max(np.array(xs)[valid]), 300)
-                        yi  = np.linspace(min(np.array(ys)[valid]),
-                                          max(np.array(ys)[valid]), 300)
-                        Xi, Yi = np.meshgrid(xi, yi)
-                        Zi  = griddata(
-                            (np.array(xs)[valid], np.array(ys)[valid]),
-                            zs[valid], (Xi, Yi), method="cubic")
+                    fig, axes = plt.subplots(1, 2, figsize=(18, 9), facecolor="#F2F3F4")
+
+                    for ax_i, ax in enumerate(axes):
+                        ax.set_facecolor("#F2F3F4")
 
                         if ax_i == 0:
-                            # Elevation + hillshade
-                            topo_cmap = LinearSegmentedColormap.from_list("terrain", [
+                            topo_cmap = LinearSegmentedColormap.from_list("terrain_c", [
                                 "#1A6FA8", "#52BE80", "#F9E79F",
                                 "#E59866", "#E74C3C", "#FDFEFE",
                             ])
-                            cf = ax.contourf(Xi, Yi, Zi, levels=20,
-                                             cmap=topo_cmap, zorder=0)
-                            dZdx = np.gradient(Zi, xi, axis=1)
-                            dZdy = np.gradient(Zi, yi, axis=0)
+                            cf = ax.contourf(Xi, Yi, Zi, levels=20, cmap=topo_cmap, zorder=0)
                             light_az  = math.radians(315)
                             light_alt = math.radians(45)
-                            slope_rad = np.arctan(np.sqrt(dZdx**2 + dZdy**2))
                             aspect    = np.arctan2(-dZdy, dZdx)
                             hillshade = np.clip(
                                 np.cos(light_alt) * np.cos(slope_rad)
                                 + np.sin(light_alt) * np.sin(slope_rad)
-                                * np.cos(light_az - aspect),
-                                0, 1)
+                                * np.cos(light_az - aspect), 0, 1)
                             ax.imshow(hillshade,
                                       extent=[xi.min(), xi.max(), yi.min(), yi.max()],
                                       origin="lower", cmap="gray",
                                       alpha=0.25, zorder=1, interpolation="bilinear")
                             cs = ax.contour(Xi, Yi, Zi, levels=10,
                                             colors="white", linewidths=0.5, alpha=0.5, zorder=2)
-                            ax.clabel(cs, inline=True, fontsize=6,
-                                      fmt="%.0f m", colors="white")
+                            ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f m", colors="white")
                             cbar = plt.colorbar(cf, ax=ax, fraction=0.025, pad=0.02)
                             cbar.set_label("Elevation (m asl)", fontsize=8)
-                            ax.set_title("Elevation Surface + Hillshade",
-                                         fontsize=10, pad=8)
+                            ax.set_title("Elevation Surface + Hillshade", fontsize=10, pad=8)
                         else:
-                            # Slope map
-                            dZdx = np.gradient(Zi, xi, axis=1)
-                            dZdy = np.gradient(Zi, yi, axis=0)
-                            slope_deg = np.degrees(np.arctan(np.sqrt(dZdx**2 + dZdy**2)))
-
                             slope_cmap = LinearSegmentedColormap.from_list("slope", [
-                                "#2ECC71", "#F1C40F", "#E67E22",
-                                "#E74C3C", "#7B241C",
+                                "#2ECC71", "#F1C40F", "#E67E22", "#E74C3C", "#7B241C",
                             ])
-                            sf = ax.contourf(Xi, Yi, slope_deg, levels=15,
-                                             cmap=slope_cmap, vmin=0, vmax=45, zorder=0)
+                            sf = ax.contourf(Xi, Yi, np.degrees(slope_rad), levels=np.linspace(0, 45, 16),
+                                             cmap=slope_cmap, extend="max", zorder=0)
                             cbar2 = plt.colorbar(sf, ax=ax, fraction=0.025, pad=0.02)
                             cbar2.set_label("Slope (degrees)", fontsize=8)
                             ax.set_title("Slope Analysis", fontsize=10, pad=8)
 
-                    edges_p["w"] = edges_p["highway"].apply(
-                        lambda x: road_width(x, scale=0.7)) if "highway" in edges_p.columns else 0.8
-                    edges_p.plot(ax=ax, linewidth=edges_p["w"],
-                                 color="white", alpha=0.45, zorder=5)
-                    buildings_p.plot(ax=ax, facecolor="white", edgecolor="#BDC3C7",
-                                     linewidth=0.2, alpha=0.55, zorder=6)
-                    ax.scatter([cx], [cy], color="white", s=180, marker="*",
-                               edgecolor="#E74C3C", linewidth=1.5, zorder=15)
-                    set_site_extent(ax, cx, cy, radius)
-                    ax.set_axis_off()
+                        edges_p["w"] = edge_widths(edges_p, 0.7, 0.8 / 0.7)
+                        edges_p.plot(ax=ax, linewidth=edges_p["w"], color="white", alpha=0.45, zorder=5)
+                        buildings_p.plot(ax=ax, facecolor="white", edgecolor="#BDC3C7",
+                                         linewidth=0.2, alpha=0.55, zorder=6)
+                        ax.scatter([cx], [cy], color="white", s=180, marker="*",
+                                   edgecolor="#E74C3C", linewidth=1.5, zorder=15)
+                        set_site_extent(ax, cx, cy, radius)
+                        ax.set_axis_off()
 
-                plt.tight_layout(pad=1.5)
+                    plt.tight_layout(pad=1.5)
+                    finish_figure(fig, "12_topography", "Topography")
 
-                svg_data = save_fig_to_svg(fig).getvalue()
-                st.session_state.svg_exports["12_topography.svg"] = svg_data
-                display_and_store(fig, "12_topography")
-                export_buttons("12_topography", fig, svg_data)
-                plt.close(fig)
-
-                if valid.sum() >= 4:
                     ev = zs[valid]
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Min Elevation",  f"{ev.min():.1f} m")
@@ -2125,11 +1970,8 @@ else:
             "No maps generated yet. Switch to **Sections** in the sidebar and load "
             "a few maps, or generate everything at once below."
         )
-        if st.button("Generate All Maps", type="primary"):
-            for mod in MODULES:
-                st.session_state[mod] = True
-            st.session_state.view_mode = "Sections"
-            st.rerun()
+        st.button("Generate All Maps", type="primary",
+                  on_click=_generate_all_and_go_to_sections)
     else:
         cols = st.columns(3)
         for i, key in enumerate(available):
@@ -2141,8 +1983,5 @@ else:
         if missing:
             st.markdown("---")
             st.caption("Not generated yet: " + ", ".join(missing))
-            if st.button("Generate Remaining Maps", type="primary"):
-                for mod in MODULES:
-                    st.session_state[mod] = True
-                st.session_state.view_mode = "Sections"
-                st.rerun()
+            st.button("Generate Remaining Maps", type="primary",
+                      on_click=_generate_all_and_go_to_sections)
