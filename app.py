@@ -2,8 +2,8 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import osmnx as ox
-ox.settings.overpass_url = "https://overpass.openstreetmap.fr/api/interpreter"
-ox.settings.overpass_endpoint = "https://overpass.openstreetmap.fr/api"
+ox.settings.overpass_url = "https://overpass.openstreetmap.ru/api/interpreter"
+ox.settings.overpass_endpoint = "https://overpass.openstreetmap.ru/api"
 
 import matplotlib
 matplotlib.use("Agg")
