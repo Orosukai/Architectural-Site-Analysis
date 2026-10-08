@@ -2,8 +2,8 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import osmnx as ox
-#ox.settings.overpass_url = "https://lz4.overpass-api.de/api/interpreter"
-#ox.settings.overpass_endpoint = "https://lz4.overpass-api.de/api"
+ox.settings.overpass_url = "https://overpass.kumi.systems/api/interpreter"
+ox.settings.overpass_endpoint = "https://overpass.kumi.systems/api"
 
 import matplotlib
 matplotlib.use("Agg")
