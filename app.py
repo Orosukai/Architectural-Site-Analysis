@@ -2,9 +2,6 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import osmnx as ox
-
-# Route OSMnx to a secondary Overpass server to avoid rate limits.
-# osmnx 2.x reads `overpass_url` (full interpreter URL); osmnx 1.x reads `overpass_endpoint`.
 ox.settings.overpass_url = "https://lz4.overpass-api.de/api/interpreter"
 ox.settings.overpass_endpoint = "https://lz4.overpass-api.de/api"
 
@@ -67,7 +64,7 @@ st.markdown("""
   --card:   #f8f9fa;
 }
 
-html, body, [class*="css"] {
+html, body, .stApp, [data-testid="stAppViewContainer"], [class*="css"] {
   font-family: 'JetBrains Mono', monospace !important;
   background-color: var(--paper) !important;
   color: var(--ink) !important;
